@@ -1,12 +1,15 @@
 # SkyGuard — Clear Night Alert
 
 A passive, once-a-day push that tells you when an upcoming night is worth setting
-up for. No dashboard to check — silent unless a night clears the threshold.
+up for. No dashboard to check — silent unless a night clears the threshold, or
+turn on `DAILY_DIGEST` for a short status **every** day (so you also know it's
+running, and why nothing's on when it isn't).
 
 It pulls the next few nights of cloud forecast for your configured location from
 [Open-Meteo](https://open-meteo.com/), evaluates **only the hours of real
-darkness** (nautical night), judges the sky **by cloud layer**, and sends a
-single [Pushover](https://pushover.net/) notification if a night looks usable.
+darkness** (nautical night), judges the sky **by cloud layer**, applies rain and
+wind vetoes, and sends a single [Pushover](https://pushover.net/) notification if
+a night looks usable.
 
 ## How it decides
 
@@ -28,6 +31,14 @@ single [Pushover](https://pushover.net/) notification if a night looks usable.
   *either* model. (Probability is noisy — often a few % on dry nights, and some
   models provide none — so the % cap sits well above zero while the mm test
   catches actually-forecast rain.)
+- **Wind (gusts are the spoiler)**: gusts shake the scope and trail subs far more
+  than steady wind, so SkyGuard gates on gusts. Over the exposure window (worst
+  value in either model), sustained wind above `WIND_SUSTAINED_WARN_KMH` (default
+  25 km/h) or gusts above `WIND_GUST_WARN_KMH` (default 40 km/h) add a **⚠ breezy**
+  flag to the push; gusts above `WIND_GUST_VETO_KMH` (default 55 km/h) **reject**
+  the night. Values are km/h (Open-Meteo's default unit). The forecast is
+  open-terrain 10 m wind, so a sheltered site is usually calmer — the defaults are
+  deliberately generous. Set the veto very high to disable it.
 - **Setup window (must be able to deploy + polar align before bed)**: you have to
   physically set up and polar align at the *start* of a session, before bed — so a
   night that only clears after you're asleep is useless. With `REQUIRE_SETUP_WINDOW`
@@ -47,11 +58,17 @@ single [Pushover](https://pushover.net/) notification if a night looks usable.
   run of at least `MIN_CONTINUOUS_RUN` hours.
 - **Moon**: reported (illumination % + phase) but not gated on — useful for
   narrowband imaging, which tolerates moonlight.
+- **Daily digest (optional)**: by default SkyGuard is silent unless a night
+  qualifies. Set `DAILY_DIGEST` and it sends a short status on **every** run — the
+  clear-night alert when a night qualifies, otherwise a "nothing tonight, here's the
+  outlook (and why)" summary with a one-line reason per night (🟢 usable / 🌧 rain /
+  💨 too windy / 🌆 not dark enough to align before bed / ☁ too cloudy). Handy as a
+  daily heartbeat that confirms the job is running.
 
 The push explains itself: per night it shows the dark window, how many hours are
 usable, the best continuous run, the moon, the per-layer cloud (average + peak),
-and — for short nights — an hour-by-hour line (`✓` both models agree usable,
-`~` only one does, `✗` not usable).
+the wind (sustained + peak gust), and — for short nights — an hour-by-hour line
+(`✓` both models agree usable, `~` only one does, `✗` not usable).
 
 ## Configure
 
@@ -74,6 +91,14 @@ out), `PRECIP_AMOUNT_MAX` (mm), `PRECIP_PROB_MAX` (%).
 `SETUP_WINDOW_END_HOUR` (your pre-bed deploy + align window), `SETUP_MIN_CLEAR_HOURS`,
 `ALIGN_DEPRESSION` (how far below the horizon the sun must be to polar align).
 
+**Wind** — `WIND_SUSTAINED_WARN_KMH` / `WIND_GUST_WARN_KMH` (km/h; above these a
+night is flagged **⚠ breezy** but still qualifies), `WIND_GUST_VETO_KMH` (gusts
+above this reject the night; set very high to disable the veto).
+
+**Daily digest** — `DAILY_DIGEST` (environment variable / Actions Variable): `1`
+(or `true`/`yes`/`on`) to send a status every run; unset or `0` to stay silent
+unless a night qualifies.
+
 ## Setup (GitHub Action)
 
 1. **Pushover**: create an [application/API token](https://pushover.net/apps/build)
@@ -84,7 +109,11 @@ out), `PRECIP_AMOUNT_MAX` (mm), `PRECIP_PROB_MAX` (%).
    - `LATITUDE`, `LONGITUDE`, `TIMEZONE` — your location. Stored as Secrets
      (encrypted, not publicly visible) so coordinates aren't exposed on a public
      repo. On a private repo you could use Variables instead.
-3. The workflow in `.github/workflows/clear-night-alert.yml` runs daily at 06:00
+3. **Variables** (optional; same page → *Variables* tab):
+   - `DAILY_DIGEST` = `1` — send a short status every day (not just on clear
+     nights), so you always know the job ran. Leave unset to stay silent unless a
+     night qualifies. It's a Variable, not a Secret, because it isn't sensitive.
+4. The workflow in `.github/workflows/clear-night-alert.yml` runs daily at 06:00
    UTC. Edit the `cron` line to change the time (cron is always UTC).
 
 ## Test it
@@ -98,7 +127,8 @@ LATITUDE=51.48 LONGITUDE=-0.0 TIMEZONE=Europe/London \
   DRY_RUN=1 .venv/bin/python main.py
 ```
 
-It prints the per-night scores and the message it *would* send. You can also
+It prints the per-night scores and the message it *would* send. Add `DAILY_DIGEST=1`
+to preview the daily-digest message even when no night qualifies. You can also
 trigger the workflow manually from the Actions tab ("Run workflow") with the
 dry-run box ticked.
 
@@ -111,3 +141,7 @@ dry-run box ticked.
 - Want astronomical darkness outside summer? Set `TWILIGHT_DEPRESSION = 18`.
 - Want to stop counting dark hours after a certain time? Set `RESPECT_CURFEW =
   True` and `CURFEW_HOUR`. (Off by default — all dark hours are reported.)
+- Windy site costing you subs? Lower `WIND_GUST_WARN_KMH` / `WIND_GUST_VETO_KMH`.
+  Very sheltered? Raise them — the forecast is open-terrain 10 m wind.
+- Want a daily heartbeat even when nothing's on? Set `DAILY_DIGEST = 1` (or the
+  `DAILY_DIGEST` Actions Variable). Great for confirming the schedule is alive.

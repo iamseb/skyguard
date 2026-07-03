@@ -41,6 +41,12 @@ def _env(name: str, default: str) -> str:
     return value or default
 
 
+def _env_bool(name: str, default: bool = False) -> bool:
+    """Boolean env var — '1', 'true', 'yes', 'on' (case-insensitive) are True."""
+    value = os.environ.get(name, "").strip().lower()
+    return value in ("1", "true", "yes", "on") if value else default
+
+
 # Observing site. Set via environment (recommended, so your location is not
 # committed) or change the defaults. Defaults to the Royal Observatory,
 # Greenwich.
@@ -54,6 +60,12 @@ TWILIGHT_DEPRESSION = 12.0
 
 # How many upcoming nights to evaluate (tonight = night 1).
 NIGHTS_AHEAD = 3
+
+# Daily digest. When True, SkyGuard sends a short status on EVERY run — the
+# clear-night alert when a night qualifies, otherwise a "nothing tonight, here's
+# the outlook (and why)" summary. When False (default) it stays silent unless a
+# night qualifies. Enable per-deployment via the DAILY_DIGEST env/variable.
+DAILY_DIGEST = _env_bool("DAILY_DIGEST", False)
 
 # Per-layer cloud thresholds. An hour is "usable" when low and mid cloud are at
 # or below their caps. Low cloud is the dominant gate. High cloud is NOT gated
@@ -75,6 +87,17 @@ EXPOSURE_START_HOUR = 21   # gear goes out
 EXPOSURE_END_HOUR = 9      # gear comes in (next morning)
 PRECIP_AMOUNT_MAX = 0.0    # mm; any forecast rain above this vetoes the night
 PRECIP_PROB_MAX = 30       # %; rain chance at/above this vetoes the night
+
+# Wind. Gusts shake the scope and trail subs far more than steady wind, so gusts
+# are what we gate on. A small refractor on a stiff pier in a sheltered garden
+# tolerates a fair bit, and the forecast is open-terrain 10 m wind, so these are
+# deliberately generous. Sustained/gusts above the WARN levels add a ⚠ to the
+# push; gusts above the VETO level reject the night (imaging is pointless).
+# Values are km/h (Open-Meteo's default wind unit), checked over the exposure
+# window in either model. Set WIND_GUST_VETO_KMH very high to disable the veto.
+WIND_SUSTAINED_WARN_KMH = 25
+WIND_GUST_WARN_KMH = 40
+WIND_GUST_VETO_KMH = 55
 
 # A night qualifies when it has at least this many usable hours AND a continuous
 # usable run of at least this length. At high latitudes a midsummer nautical
@@ -140,6 +163,8 @@ class HourCloud:
     secondary: dict[str, int | None]
     precip_mm: dict[str, float | None]  # {"primary": .., "secondary": ..}
     precip_prob: dict[str, int | None]  # {"primary": .., "secondary": ..}
+    wind_kmh: dict[str, float | None]   # {"primary": .., "secondary": ..}
+    gust_kmh: dict[str, float | None]   # {"primary": .., "secondary": ..}
 
     @property
     def max_precip_mm(self) -> float:
@@ -150,6 +175,16 @@ class HourCloud:
     def max_precip_prob(self) -> int | None:
         vals = [v for v in self.precip_prob.values() if v is not None]
         return max(vals) if vals else None
+
+    @property
+    def max_wind_kmh(self) -> float:
+        vals = [v for v in self.wind_kmh.values() if v is not None]
+        return max(vals) if vals else 0.0
+
+    @property
+    def max_gust_kmh(self) -> float:
+        vals = [v for v in self.gust_kmh.values() if v is not None]
+        return max(vals) if vals else 0.0
 
     @property
     def wet(self) -> bool:
@@ -210,6 +245,9 @@ class NightScore:
     rain_vetoed: bool
     rain_max_mm: float
     rain_max_prob: int | None
+    wind_max_kmh: int
+    gust_max_kmh: int
+    windy_vetoed: bool
     exposure_window: str
     setup_window: str
     setup_usable_confident: int
@@ -221,6 +259,8 @@ class NightScore:
     @property
     def qualifies(self) -> bool:
         if self.rain_vetoed:
+            return False
+        if self.windy_vetoed:
             return False
         if REQUIRE_SETUP_WINDOW and not self.setup_ok:
             return False  # can't deploy + polar align before bed → not actionable
@@ -244,7 +284,8 @@ def fetch_forecast() -> list[HourCloud]:
         "latitude": LATITUDE,
         "longitude": LONGITUDE,
         "hourly": "cloud_cover_low,cloud_cover_mid,cloud_cover_high,"
-                  "precipitation,precipitation_probability",
+                  "precipitation,precipitation_probability,"
+                  "wind_speed_10m,wind_gusts_10m",
         "models": f"{PRIMARY_MODEL},{SECONDARY_MODEL}",
         "timezone": TIMEZONE,
         "forecast_days": FORECAST_DAYS,
@@ -269,6 +310,10 @@ def fetch_forecast() -> list[HourCloud]:
                  "secondary": series("precipitation", SECONDARY_MODEL)}
     precip_prob = {"primary": series("precipitation_probability", PRIMARY_MODEL),
                    "secondary": series("precipitation_probability", SECONDARY_MODEL)}
+    wind_kmh = {"primary": series("wind_speed_10m", PRIMARY_MODEL),
+                "secondary": series("wind_speed_10m", SECONDARY_MODEL)}
+    gust_kmh = {"primary": series("wind_gusts_10m", PRIMARY_MODEL),
+                "secondary": series("wind_gusts_10m", SECONDARY_MODEL)}
 
     out: list[HourCloud] = []
     for i, t in enumerate(times):
@@ -279,6 +324,8 @@ def fetch_forecast() -> list[HourCloud]:
             secondary={l: secondary_cloud[l][i] for l in LAYERS},
             precip_mm={k: precip_mm[k][i] for k in precip_mm},
             precip_prob={k: precip_prob[k][i] for k in precip_prob},
+            wind_kmh={k: wind_kmh[k][i] for k in wind_kmh},
+            gust_kmh={k: gust_kmh[k][i] for k in gust_kmh},
         ))
     return out
 
@@ -377,6 +424,11 @@ def score_night(
     rain_max_prob = max(probs) if probs else None
     win_start, win_end = exposure_window(night)
 
+    # Wind over the exposure window — gusts are the spoiler, so we veto on gusts.
+    wind_max = round(max((h.max_wind_kmh for h in exposure_hours), default=0.0))
+    gust_max = round(max((h.max_gust_kmh for h in exposure_hours), default=0.0))
+    windy_vetoed = gust_max > WIND_GUST_VETO_KMH
+
     # Setup / polar-align window (pre-bed): need hours that are BOTH dark enough
     # to align AND clear, before bedtime. In midsummer the darkness test is what
     # makes a night fail — it's simply not dark enough to align before bed.
@@ -422,6 +474,9 @@ def score_night(
         rain_vetoed=rain_vetoed,
         rain_max_mm=rain_max_mm,
         rain_max_prob=rain_max_prob,
+        wind_max_kmh=wind_max,
+        gust_max_kmh=gust_max,
+        windy_vetoed=windy_vetoed,
         exposure_window=f"{win_start:%H:%M}–{win_end:%H:%M}",
         setup_window=f"{su_start:%H:%M}–{su_end:%H:%M}",
         setup_usable_confident=setup_conf,
@@ -481,6 +536,11 @@ def format_night(s: NightScore) -> str:
         f"rain {s.exposure_window}: dry (max chance {prob}, max {s.rain_max_mm:.1f}mm)"
     )
 
+    breezy = (s.gust_max_kmh > WIND_GUST_WARN_KMH
+              or s.wind_max_kmh > WIND_SUSTAINED_WARN_KMH)
+    wind_line = f"wind: {s.wind_max_kmh} km/h, gusts {s.gust_max_kmh} km/h"
+    lines.append(wind_line + " ⚠ breezy" if breezy else wind_line)
+
     if total <= MAX_HOURLY_DETAIL:
         for h in s.dark_hours:
             mark = "✓" if h.usable_confident else ("~" if h.usable_any else "✗")
@@ -499,6 +559,39 @@ def build_message(qualifying: list[NightScore]) -> tuple[str, str]:
         title = f"{len(qualifying)} clear nights ahead"
     body = "\n\n".join(format_night(s) for s in qualifying)
     return title, body
+
+
+def _reason(s: NightScore) -> str:
+    """One-line human verdict for the daily digest."""
+    if s.qualifies:
+        tentative = s.tentative
+        hrs = s.any_usable_hours if tentative else s.confident_usable_hours
+        run = s.best_run_any_len if tentative else s.best_run_len
+        start = s.best_run_any_start if tentative else s.best_run_start
+        frm = start.strftime("%H:%M") if start else "?"
+        return f"🟢 usable {hrs}h · best run {run}h from {frm}"
+    if s.rain_vetoed:
+        prob = f"{s.rain_max_prob}%" if s.rain_max_prob is not None else "n/a"
+        return f"🌧 rain in the window ({prob}, {s.rain_max_mm:.1f}mm)"
+    if s.windy_vetoed:
+        return f"💨 too windy (gusts {s.gust_max_kmh} km/h)"
+    if REQUIRE_SETUP_WINDOW and not s.setup_ok:
+        if s.setup_alignable == 0:
+            return "🌆 not dark enough to align before bed"
+        return "☁ cloudy during the setup window"
+    low = s.layer_stats["low"]
+    return f"☁ too cloudy (low {low[0] if low else '?'}%)"
+
+
+def build_digest(scores: list[NightScore]) -> tuple[str, str]:
+    title = f"SkyGuard: no clear nights (next {len(scores)})"
+    lines = ["No night qualifies right now — outlook:"]
+    for s in scores:
+        day = s.night.strftime("%a %-d %b")
+        windy = s.gust_max_kmh > WIND_GUST_WARN_KMH and not s.windy_vetoed
+        extra = f" · 💨 gusts {s.gust_max_kmh}" if windy else ""
+        lines.append(f"<b>{day}</b> · Moon {s.moon_illum}%{extra}\n{_reason(s)}")
+    return title, "\n\n".join(lines)
 
 
 def send_pushover(title: str, message: str) -> None:
@@ -559,6 +652,8 @@ def main() -> int:
             marker = "QUALIFIES"
         elif s.rain_vetoed:
             marker = "VETOED-rain"
+        elif s.windy_vetoed:
+            marker = "VETOED-wind"
         elif REQUIRE_SETUP_WINDOW and not s.setup_ok:
             marker = "NO-ALIGN-BEFORE-BED" if s.setup_alignable == 0 else "SETUP-CLOUDY"
         else:
@@ -572,16 +667,20 @@ def main() -> int:
             f"low cloud avg {low[0] if low else '?'}%, "
             f"rain max {s.rain_max_mm:.1f}mm/"
             f"{s.rain_max_prob if s.rain_max_prob is not None else '-'}%, "
+            f"wind {s.wind_max_kmh}/gust {s.gust_max_kmh}km/h, "
             f"moon {s.moon_illum}%"
         )
 
     qualifying = [s for s in scores if s.qualifies]
-    if not qualifying:
-        print("No qualifying nights — staying silent.")
+    if qualifying:
+        title, message = build_message(qualifying)
+        send_pushover(title, message)
         return 0
-
-    title, message = build_message(qualifying)
-    send_pushover(title, message)
+    if DAILY_DIGEST and scores:
+        title, message = build_digest(scores)
+        send_pushover(title, message)
+        return 0
+    print("No qualifying nights — staying silent.")
     return 0
 
 

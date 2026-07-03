@@ -29,4 +29,8 @@ jobs:
           LATITUDE: ${{ secrets.LATITUDE }}
           LONGITUDE: ${{ secrets.LONGITUDE }}
           TIMEZONE: ${{ secrets.TIMEZONE }}
+          # Optional: set an Actions Variable DAILY_DIGEST=1 for a short status
+          # every day (not just on clear nights). Not sensitive, so a Variable
+          # rather than a Secret. Unset = silent unless a night qualifies.
+          DAILY_DIGEST: ${{ vars.DAILY_DIGEST }}
           DRY_RUN: ${{ inputs.dry_run && '1' || '' }}
