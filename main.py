@@ -257,13 +257,9 @@ class NightScore:
     setup_align_from: datetime | None  # earliest clear + dark-enough moment
 
     @property
-    def qualifies(self) -> bool:
-        if self.rain_vetoed:
-            return False
-        if self.windy_vetoed:
-            return False
-        if REQUIRE_SETUP_WINDOW and not self.setup_ok:
-            return False  # can't deploy + polar align before bed → not actionable
+    def sky_ok(self) -> bool:
+        """The dark-hours cloud/run criteria pass — ignoring rain, wind and the
+        setup gate. i.e. the sky itself is good enough to image."""
         if (
             self.confident_usable_hours >= MIN_USABLE_HOURS
             and self.best_run_len >= MIN_CONTINUOUS_RUN
@@ -272,6 +268,26 @@ class NightScore:
         return (
             self.any_usable_hours >= MIN_USABLE_HOURS
             and self.best_run_any_len >= MIN_CONTINUOUS_RUN
+        )
+
+    @property
+    def qualifies(self) -> bool:
+        if self.rain_vetoed or self.windy_vetoed:
+            return False
+        if REQUIRE_SETUP_WINDOW and not self.setup_ok:
+            return False  # can't deploy + polar align before bed → not actionable
+        return self.sky_ok
+
+    @property
+    def sky_good_but_blocked(self) -> bool:
+        """Clear, calm and dry — and ONLY the setup/align gate stops it
+        qualifying. Drives the amber 'weather's fine, timing isn't' light."""
+        return (
+            self.sky_ok
+            and not self.rain_vetoed
+            and not self.windy_vetoed
+            and REQUIRE_SETUP_WINDOW
+            and not self.setup_ok
         )
 
 
@@ -552,11 +568,22 @@ def format_night(s: NightScore) -> str:
     return "\n".join(lines)
 
 
+def verdict_light(scores: list[NightScore]) -> str:
+    """Traffic-light for the notification title, read at a glance on the banner:
+    🟢 a night qualifies · 🟡 sky's clear but only the align gate blocks it ·
+    🔴 genuinely clouded / rained / blown out."""
+    if any(s.qualifies for s in scores):
+        return "🟢"
+    if any(s.sky_good_but_blocked for s in scores):
+        return "🟡"
+    return "🔴"
+
+
 def build_message(qualifying: list[NightScore]) -> tuple[str, str]:
     if len(qualifying) == 1:
-        title = f"Clear night: {qualifying[0].night.strftime('%a %-d %b')}"
+        title = f"🟢 Clear night: {qualifying[0].night.strftime('%a %-d %b')}"
     else:
-        title = f"{len(qualifying)} clear nights ahead"
+        title = f"🟢 {len(qualifying)} clear nights ahead"
     body = "\n\n".join(format_night(s) for s in qualifying)
     return title, body
 
@@ -584,7 +611,11 @@ def _reason(s: NightScore) -> str:
 
 
 def build_digest(scores: list[NightScore]) -> tuple[str, str]:
-    title = f"SkyGuard: no clear nights (next {len(scores)})"
+    light = verdict_light(scores)
+    if light == "🟡":
+        title = "🟡 SkyGuard: clear — but not dark enough to align yet"
+    else:
+        title = f"🔴 SkyGuard: nothing on (next {len(scores)})"
     lines = ["No night qualifies right now — outlook:"]
     for s in scores:
         day = s.night.strftime("%a %-d %b")

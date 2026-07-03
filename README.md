@@ -64,6 +64,10 @@ a night looks usable.
   outlook (and why)" summary with a one-line reason per night (🟢 usable / 🌧 rain /
   💨 too windy / 🌆 not dark enough to align before bed / ☁ too cloudy). Handy as a
   daily heartbeat that confirms the job is running.
+- **Traffic-light title**: every notification's title leads with a light you can
+  read from the lock screen — **🟢** a night qualifies (go), **🟡** the sky's clear
+  but only the align-before-bed/darkness gate blocks it (weather's on your side,
+  the season/timing isn't), **🔴** genuinely clouded / rained / blown out.
 
 The push explains itself: per night it shows the dark window, how many hours are
 usable, the best continuous run, the moon, the per-layer cloud (average + peak),
