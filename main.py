@@ -116,6 +116,14 @@ SETUP_WINDOW_START_HOUR = 21   # earliest you'd start setting up
 SETUP_WINDOW_END_HOUR = 23     # bedtime — setup + align must be done by here
 SETUP_MIN_CLEAR_HOURS = 1      # clear+dark hours needed in the window to align
 
+# Later bedtime on some nights. Bedtime (the setup-window end) isn't the same
+# every night — on Friday and Saturday nights it can run an hour or two later.
+# Map the weekday of the EVENING (Mon=0, Tue=1, … Fri=4, Sat=5, Sun=6) to a
+# later end hour; nights not listed fall back to SETUP_WINDOW_END_HOUR. Hours ≥24
+# mean past midnight, so 25 = 01:00 the next morning. Default: Fri/Sat nights run
+# to 01:00. Empty the dict to give every night the same bedtime.
+SETUP_WINDOW_END_HOUR_BY_WEEKDAY: dict[int, int] = {4: 25, 5: 25}  # Fri, Sat → 01:00
+
 # Polar alignment also needs the sky dark enough to see/plate-solve stars, so a
 # setup-window hour only counts if the sun is at least this far below the horizon
 # (degrees) AND it's clear. At 52N in midsummer this is the binding constraint —
@@ -407,10 +415,19 @@ def exposure_window(night: date) -> tuple[datetime, datetime]:
     return start, end
 
 
+def setup_end_hour(night: date) -> int:
+    """Bedtime (setup-window end) for the evening of `night`, applying any
+    per-weekday override — e.g. a later cut-off on Fri/Sat nights. May be ≥24
+    to mean past midnight (25 = 01:00 next morning)."""
+    return SETUP_WINDOW_END_HOUR_BY_WEEKDAY.get(night.weekday(), SETUP_WINDOW_END_HOUR)
+
+
 def setup_window(night: date) -> tuple[datetime, datetime]:
-    """The pre-bed window to set up and polar align, on the evening of `night`."""
+    """The pre-bed window to set up and polar align, on the evening of `night`.
+    The end (bedtime) can fall past midnight on nights with a later cut-off."""
     start = datetime.combine(night, time(SETUP_WINDOW_START_HOUR), tzinfo=TZ)
-    end = datetime.combine(night, time(SETUP_WINDOW_END_HOUR), tzinfo=TZ)
+    day_offset, end_hour = divmod(setup_end_hour(night), 24)
+    end = datetime.combine(night + timedelta(days=day_offset), time(end_hour), tzinfo=TZ)
     return start, end
 
 

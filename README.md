@@ -94,6 +94,10 @@ out), `PRECIP_AMOUNT_MAX` (mm), `PRECIP_PROB_MAX` (%).
 **Setup window** — `REQUIRE_SETUP_WINDOW` (on/off), `SETUP_WINDOW_START_HOUR` /
 `SETUP_WINDOW_END_HOUR` (your pre-bed deploy + align window), `SETUP_MIN_CLEAR_HOURS`,
 `ALIGN_DEPRESSION` (how far below the horizon the sun must be to polar align).
+`SETUP_WINDOW_END_HOUR_BY_WEEKDAY` overrides bedtime per weekday of the evening
+(Mon=0 … Sun=6) for nights you stay up later — the default runs Fri/Sat nights to
+01:00 (hours ≥24 mean past midnight, so 25 = 01:00). Empty the dict for a uniform
+bedtime every night.
 
 **Wind** — `WIND_SUSTAINED_WARN_KMH` / `WIND_GUST_WARN_KMH` (km/h; above these a
 night is flagged **⚠ breezy** but still qualifies), `WIND_GUST_VETO_KMH` (gusts
