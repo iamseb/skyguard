@@ -2,7 +2,7 @@ name: SkyGuard — Clear Night Alert
 
 on:
   schedule:
-    # Morning outlook (next few nights). 06:00 UTC = 08:00 CEST / 07:00 CET.
+    # Morning outlook (tonight + tomorrow). 06:00 UTC = 08:00 CEST / 07:00 CET.
     - cron: "0 6 * * *"
     # Evening update for tonight at 18:00 local (EVENING_HOUR in main.py). Cron
     # is UTC and doesn't follow daylight saving, so fire both candidate slots —
@@ -13,7 +13,7 @@ on:
   workflow_dispatch:
     inputs:
       mode:
-        description: "outlook = next few nights (morning) · tonight = evening update"
+        description: "outlook = tonight + tomorrow (morning) · tonight = evening update"
         type: choice
         options: [outlook, tonight]
         default: outlook

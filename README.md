@@ -1,12 +1,12 @@
 # SkyGuard — Clear Night Alert
 
 A passive push that tells you when an upcoming night is worth setting up for —
-a morning **outlook** for the next few nights, then an **evening update** at 18:00
+a morning **outlook** for tonight and tomorrow, then an **evening update** at 18:00
 that re-checks just tonight with the freshest model runs. No dashboard to check — silent unless a night clears the threshold, or
 turn on `DAILY_DIGEST` for a short status **every** day (so you also know it's
 running, and why nothing's on when it isn't).
 
-It pulls the next few nights of cloud forecast for your configured location from
+It pulls the coming nights' cloud forecast for your configured location from
 [Open-Meteo](https://open-meteo.com/), evaluates **only the hours of real
 darkness** (nautical night), judges the sky **by cloud layer**, applies rain and
 wind vetoes, and sends a single [Pushover](https://pushover.net/) notification if
@@ -53,6 +53,13 @@ a night looks usable.
   stays silent (correctly — there's no point deploying). Once a **permanent pier**
   holds the mount aligned, set `REQUIRE_SETUP_WINDOW = False` — nightly alignment is
   then unnecessary and only the dark hours matter.
+- **Only nights both models cover**: the high-resolution primary model reaches
+  only ~2½ days ahead. Beyond that a verdict would rest on the global model alone
+  and can swing a lot from one run to the next, so with `REQUIRE_BOTH_MODELS` on
+  (default) a later night is scored only once both models cover its whole dark
+  and equipment-exposure windows. In practice: tonight + tomorrow in the morning,
+  tonight in the evening. Tonight is always scored, so if one model is down you
+  get a tentative verdict rather than silence. `NIGHTS_AHEAD` is the upper limit.
 - **Confidence tiers**: a night that passes every rule is **🟢 confident** only
   if both models *agree* on a usable run of at least `CONFIDENT_MIN_RUN` hours
   (default 2) with high cloud at or below `HIGH_CLOUD_CONFIDENT_MAX` (default 60%)
@@ -113,7 +120,7 @@ in the `CONFIG` block of `main.py`:
   defaults suit the Netherlands — pick regional models from Open-Meteo's list)
 
 **Thresholds** — `LOW_CLOUD_MAX`, `MID_CLOUD_MAX`, `HIGH_CLOUD_MAX`,
-`CONFIDENT_MIN_RUN`, `HIGH_CLOUD_CONFIDENT_MAX`, `MIN_USABLE_HOURS`, `MIN_CONTINUOUS_RUN`, `TWILIGHT_DEPRESSION`, `NIGHTS_AHEAD`,
+`CONFIDENT_MIN_RUN`, `HIGH_CLOUD_CONFIDENT_MAX`, `MIN_USABLE_HOURS`, `MIN_CONTINUOUS_RUN`, `TWILIGHT_DEPRESSION`, `NIGHTS_AHEAD`, `REQUIRE_BOTH_MODELS`,
 `RESPECT_CURFEW` — all in the `CONFIG` block.
 
 **Rain veto** — `EXPOSURE_START_HOUR` / `EXPOSURE_END_HOUR` (when the gear is
@@ -136,7 +143,7 @@ above this reject the night; set very high to disable the veto).
 unless a night qualifies (or a 🟢 night drops).
 
 **Run mode** — `RUN_MODE` (environment): `outlook` (default; the next
-`NIGHTS_AHEAD` nights) or `tonight` (the evening update). `EVENING_HOUR` (in
+nights both models cover, up to `NIGHTS_AHEAD`) or `tonight` (the evening update). `EVENING_HOUR` (in
 `CONFIG`, default 18) is the local hour the evening run is meant for.
 
 **History** — `STATE_FILE` (environment; default `.skyguard/state.json`) is where

@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """SkyGuard — clear-night forecast alert.
 
-Runs each morning (the "outlook": the next few nights) and again each evening
+Runs each morning (the "outlook": tonight and any later night both forecast
+models already cover) and again each evening
 (the "tonight" update: a fresher look at just tonight). Pulls cloud forecast for
 a configured location from Open-Meteo (one primary model, one cross-check),
 evaluates only the hours of real darkness (nautical night), and sends a single
@@ -67,11 +68,19 @@ TIMEZONE = _env("TIMEZONE", "Europe/London")
 # At high latitudes nautical night can be the only real darkness in midsummer.
 TWILIGHT_DEPRESSION = 12.0
 
-# How many upcoming nights to evaluate (tonight = night 1).
+# How many upcoming nights to evaluate at most (tonight = night 1).
 NIGHTS_AHEAD = 3
 
-# Run mode. "outlook" (default, the morning run) scores the next NIGHTS_AHEAD
-# nights. "tonight" (the evening run) re-scores just tonight with the freshest
+# Only score a night once BOTH models cover it — its whole dark window and the
+# equipment-exposure window. The high-resolution primary model only reaches ~2½
+# days ahead, so beyond that a verdict would rest on the global model alone and
+# can swing a lot between runs. In practice the morning outlook then covers
+# tonight and tomorrow, and the evening update tonight. Tonight is always scored,
+# so an outage of one model shows up as a tentative verdict rather than silence.
+REQUIRE_BOTH_MODELS = True
+
+# Run mode. "outlook" (default, the morning run) scores the upcoming nights
+# (see NIGHTS_AHEAD / REQUIRE_BOTH_MODELS). "tonight" (the evening run) re-scores just tonight with the freshest
 # model runs and always shows the hour-by-hour picture.
 RUN_MODE = _env("RUN_MODE", "outlook").lower()
 
@@ -365,6 +374,8 @@ class NightScore:
     @property
     def speculative_reason(self) -> str:
         """Why a qualifying night is only 🟡."""
+        if not _both_models_cover(self.dark_hours):
+            return "only one model available"
         if self.best_run_len < CONFIDENT_MIN_RUN:
             return "models disagree"
         if self.strict_run_len < CONFIDENT_MIN_RUN:
@@ -942,8 +953,18 @@ def evening_slot_due() -> bool:
     return slot.astimezone(TZ).hour == EVENING_HOUR
 
 
+def _both_models_cover(hours: list[HourCloud]) -> bool:
+    """True when both models have cloud data for every one of these hours."""
+    return all(
+        h.primary.get("low") is not None and h.secondary.get("low") is not None
+        for h in hours
+    )
+
+
 def score_nights(hours: list[HourCloud], count: int) -> list[NightScore]:
-    """Score `count` nights starting with tonight."""
+    """Score up to `count` nights starting with tonight. With
+    REQUIRE_BOTH_MODELS, stop at the first later night that both models don't
+    yet fully cover."""
     by_night: dict[date, list[HourCloud]] = {}
     for h in hours:
         if is_dark(h.time):
@@ -960,6 +981,10 @@ def score_nights(hours: list[HourCloud], count: int) -> list[NightScore]:
         exposure_hours = [h for h in hours if win_start <= h.time < win_end]
         su_start, su_end = setup_window(night)
         setup_hours = [h for h in hours if su_start <= h.time < su_end]
+        if (REQUIRE_BOTH_MODELS and i > 0
+                and not _both_models_cover(dark_hours + exposure_hours)):
+            print(f"[beyond both models] {night}: not scored yet")
+            break  # later nights are further out still
         s = score_night(night, dark_hours, exposure_hours, setup_hours)
         if s is not None:
             scores.append(s)
