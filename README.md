@@ -21,10 +21,11 @@ a night looks usable.
 - **Cloud, by layer**: rather than one lumped "total cloud" number, an hour is
   **usable** when *low* cloud ≤ `LOW_CLOUD_MAX` (default 20%) and *mid* cloud ≤
   `MID_CLOUD_MAX` (default 50%). Low cloud is the real gate — it's opaque. *High*
-  cloud (cirrus) is thin and partly transparent, so it is **not** gated by
-  default (set `HIGH_CLOUD_MAX` to gate on it); it's reported, and flagged as
-  "thin high cloud" when notable. This avoids the over-pessimism of tools that
-  gate on total cloud, which inflates with harmless cirrus.
+  cloud (cirrus) is thin and partly transparent, so it doesn't stop a night
+  qualifying (set `HIGH_CLOUD_MAX` to make it) — but it does decide how
+  *confident* the verdict is (see **Confidence tiers**). This avoids the
+  over-pessimism of tools that gate on total cloud, which inflates with harmless
+  cirrus.
 - **Rain is a hard veto**: rain ruins the gear, not just the session. A night is
   rejected outright if any hour in the **equipment-exposure window** (the gear is
   outside, default 21:00–09:00 — wider than the dark hours) has forecast rain
@@ -52,9 +53,18 @@ a night looks usable.
   stays silent (correctly — there's no point deploying). Once a **permanent pier**
   holds the mount aligned, set `REQUIRE_SETUP_WINDOW = False` — nightly alignment is
   then unnecessary and only the dark hours matter.
-- **Confidence**: *high* when both models agree the hour is usable; *tentative*
-  when only one model is available (a high-resolution model's horizon may be
-  ~48h) or they disagree — tentative nights are flagged in the message.
+- **Confidence tiers**: a night that passes every rule is **🟢 confident** only
+  if both models *agree* on a usable run of at least `CONFIDENT_MIN_RUN` hours
+  (default 2) with high cloud at or below `HIGH_CLOUD_CONFIDENT_MAX` (default 60%)
+  in each — and, with the setup gate on, the setup window passes the same test.
+  Otherwise it's **🟡 speculative**, with the reason given (models disagree /
+  heavy high cloud). Why high cloud matters here even for narrowband: thin cirrus
+  is fine to image through, but a forecast of *heavy* high cloud can't tell thin
+  cirrus from a thick frontal sheet, and those nights mostly fail. Checked against
+  a year of hourly observed cloud and rain from a national weather station near
+  the test site (align-before-bed gate on): 🟢 nights gave a real session (≥3h
+  continuous clear, dry) **65%** of the time, 🟡 nights only **9%**, versus 36%
+  for all qualifying nights together.
 - **Qualifies**: at least `MIN_USABLE_HOURS` usable hours **and** a continuous
   run of at least `MIN_CONTINUOUS_RUN` hours.
 - **Moon**: reported (illumination % + phase) but not gated on — useful for
@@ -70,27 +80,27 @@ a night looks usable.
   the morning outlook. The evening run re-scores **tonight only** and gives a
   go / no-go: "🟢 Tonight's on — set up from 21:00", "🔴 Tonight's off — rain
   forecast (was 🟢)", with an hour-by-hour strip for the whole dark window
-  (`21✓ 22✓ 23~ 00✗ …`). It follows the same rules as the morning run: it pushes
-  when tonight qualifies, when tonight *was* 🟢 and no longer is, or every time if
-  `DAILY_DIGEST` is on.
+  (`21✓ 22◐ 23~ 00✗ …`). It follows the same rules as the morning run: it pushes
+  when tonight is 🟢 or 🟡, when tonight's light has dropped since the last run,
+  or every time if `DAILY_DIGEST` is on.
 - **Forecast history (what changed)**: every run records a compact verdict per
   night (light, usable hours, low/mid cloud, rain, gusts), and the next run
   compares against it. Each night in the push then carries a line such as
   `↻ 🔴🟡→🟢 since yesterday evening · usable 1→6h · low 60→15%`, or
   `↻ 🟢🟢→🟢 unchanged since this morning` — a forecast that holds steady across
   several runs is one you can trust more. Small wobbles are ignored
-  (`CHANGE_HOURS`, `CHANGE_CLOUD_PTS`, `CHANGE_GUST_KMH`). A night that was 🟢 and
-  has since dropped **always** triggers a push, even with the digest off, so you're
-  never left planning around a stale forecast.
+  (`CHANGE_HOURS`, `CHANGE_CLOUD_PTS`, `CHANGE_GUST_KMH`). A night whose light has
+  dropped (🟢→🟡, 🟡→🔴, …) **always** triggers a push, even with the digest off, so
+  you're never left planning around a stale forecast.
 - **Traffic-light title**: every notification's title leads with a light you can
-  read from the lock screen — **🟢** a night qualifies (go), **🟡** the sky's clear
-  but only the align-before-bed/darkness gate blocks it (weather's on your side,
-  the season/timing isn't), **🔴** genuinely clouded / rained / blown out.
+  read from the lock screen — **🟢** a confident go, **🟡** a speculative maybe,
+  **🔴** off (cloud, rain, wind, or no clear + dark hour to align before bed).
 
 The push explains itself: per night it shows the dark window, how many hours are
 usable, the best continuous run, the moon, the per-layer cloud (average + peak),
 the wind (sustained + peak gust), and — for short nights — an hour-by-hour line
-(`✓` both models agree usable, `~` only one does, `✗` not usable).
+(`✓` both models agree usable with modest high cloud, `◐` both agree but under
+heavy high cloud, `~` only one model says usable, `✗` not usable).
 
 ## Configure
 
@@ -103,7 +113,7 @@ in the `CONFIG` block of `main.py`:
   defaults suit the Netherlands — pick regional models from Open-Meteo's list)
 
 **Thresholds** — `LOW_CLOUD_MAX`, `MID_CLOUD_MAX`, `HIGH_CLOUD_MAX`,
-`MIN_USABLE_HOURS`, `MIN_CONTINUOUS_RUN`, `TWILIGHT_DEPRESSION`, `NIGHTS_AHEAD`,
+`CONFIDENT_MIN_RUN`, `HIGH_CLOUD_CONFIDENT_MAX`, `MIN_USABLE_HOURS`, `MIN_CONTINUOUS_RUN`, `TWILIGHT_DEPRESSION`, `NIGHTS_AHEAD`,
 `RESPECT_CURFEW` — all in the `CONFIG` block.
 
 **Rain veto** — `EXPOSURE_START_HOUR` / `EXPOSURE_END_HOUR` (when the gear is
@@ -182,8 +192,11 @@ the mode and ticking the dry-run box.
 
 - Quiet all summer? Lower `MIN_USABLE_HOURS` / `MIN_CONTINUOUS_RUN`, or raise
   `LOW_CLOUD_MAX`.
-- Stricter about haze? Set `HIGH_CLOUD_MAX` (e.g. 60) to also reject hours with
-  heavy cirrus. Leave it `None` to tolerate high cloud (best for narrowband).
+- Too many 🟡 maybes? Set `HIGH_CLOUD_MAX` (e.g. 60) to reject heavy-high-cloud
+  hours outright, so those nights go 🔴 instead. Want more 🟢 nights at a lower hit
+  rate? Raise `HIGH_CLOUD_CONFIDENT_MAX` or lower `CONFIDENT_MIN_RUN`. Tweaking
+  `LOW_CLOUD_MAX` / `MID_CLOUD_MAX` changed the hit rate very little in testing —
+  model agreement and high cloud are the levers that matter.
 - Want astronomical darkness outside summer? Set `TWILIGHT_DEPRESSION = 18`.
 - Want to stop counting dark hours after a certain time? Set `RESPECT_CURFEW =
   True` and `CURFEW_HOUR`. (Off by default — all dark hours are reported.)

@@ -15,7 +15,9 @@ Cloud is judged by LAYER, not as one lumped total. Low cloud is the real gate
 for astrophotography — it's opaque. Mid cloud also blocks. High cloud (cirrus)
 is thin and partly transparent, so by default it is reported but does NOT reject
 an hour (narrowband tolerates it). This avoids the over-pessimism of tools that
-gate on total cloud cover, which inflates with harmless high cirrus.
+gate on total cloud cover, which inflates with harmless high cirrus. Heavy
+forecast high cloud does, however, drop a night from 🟢 confident to 🟡
+speculative — see the confidence tiers in CONFIG.
 
 Set your location with the LATITUDE / LONGITUDE / TIMEZONE environment variables
 (or edit the defaults below). Tune behaviour in the CONFIG block. Set DRY_RUN=1
@@ -103,6 +105,17 @@ LOW_CLOUD_MAX = 20
 MID_CLOUD_MAX = 50
 HIGH_CLOUD_MAX: int | None = None
 HIGH_CLOUD_NOTE = 40  # average high cloud above this gets a note in the push
+
+# Confidence tiers. A night that passes the rules above is 🟡 SPECULATIVE; it is
+# 🟢 CONFIDENT only if both models also agree on a usable run of at least
+# CONFIDENT_MIN_RUN hours with high cloud at or below HIGH_CLOUD_CONFIDENT_MAX in
+# each model (and, with the setup gate on, the setup window passes that test
+# too). Thin cirrus is fine for narrowband, but a forecast of heavy high cloud
+# can't tell thin cirrus from a thick frontal sheet — and such nights usually
+# fail. Checked against a year of observed cloud near the site: confident nights
+# gave a real session ~65% of the time, versus ~36% for the plain rules.
+CONFIDENT_MIN_RUN = 2
+HIGH_CLOUD_CONFIDENT_MAX = 60
 
 # Precipitation veto. Rain on the kit is a hard no, so the night is rejected if
 # ANY hour in the equipment-exposure window has forecast rain above
@@ -232,10 +245,11 @@ class HourCloud:
         return prob is not None and prob >= PRECIP_PROB_MAX
 
     @staticmethod
-    def _usable(layers: dict[str, int | None]) -> bool | None:
+    def _usable(layers: dict[str, int | None], strict: bool = False) -> bool | None:
         """True/False if the model has data for this hour, else None.
 
-        Gates on low and mid cloud; high cloud only if HIGH_CLOUD_MAX is set.
+        Gates on low and mid cloud; high cloud only if HIGH_CLOUD_MAX is set,
+        or — when `strict` (the confident tier) — at HIGH_CLOUD_CONFIDENT_MAX.
         """
         if all(layers.get(k) is None for k in LAYERS):
             return None
@@ -244,7 +258,10 @@ class HourCloud:
             return False
         if mid is not None and mid > MID_CLOUD_MAX:
             return False
-        if HIGH_CLOUD_MAX is not None and high is not None and high > HIGH_CLOUD_MAX:
+        high_max = HIGH_CLOUD_MAX
+        if strict:
+            high_max = min(HIGH_CLOUD_CONFIDENT_MAX, HIGH_CLOUD_MAX or HIGH_CLOUD_CONFIDENT_MAX)
+        if high_max is not None and high is not None and high > high_max:
             return False
         return True
 
@@ -256,6 +273,17 @@ class HourCloud:
     @property
     def usable_any(self) -> bool:
         return self._usable(self.primary) is True or self._usable(self.secondary) is True
+
+    @property
+    def usable_strict(self) -> bool:
+        """Confident tier: both models usable with high cloud capped too."""
+        return (self._usable(self.primary, strict=True) is True
+                and self._usable(self.secondary, strict=True) is True)
+
+    @property
+    def usable_any_strict(self) -> bool:
+        return (self._usable(self.primary, strict=True) is True
+                or self._usable(self.secondary, strict=True) is True)
 
     def layer(self, name: str) -> int | None:
         """Representative value for a layer: primary if present, else secondary."""
@@ -292,6 +320,8 @@ class NightScore:
     setup_ok: bool
     setup_alignable: int          # window hours dark enough to align
     setup_align_from: datetime | None  # earliest clear + dark-enough moment
+    strict_run_len: int           # both models agree AND high cloud ≤ confident cap
+    setup_strict_ok: bool         # setup window passes with the high-cloud cap
 
     @property
     def sky_ok(self) -> bool:
@@ -316,14 +346,30 @@ class NightScore:
         return self.sky_ok
 
     @property
+    def confident(self) -> bool:
+        """Qualifies AND both models agree on a run with modest high cloud."""
+        if not self.qualifies or self.strict_run_len < CONFIDENT_MIN_RUN:
+            return False
+        return self.setup_strict_ok or not REQUIRE_SETUP_WINDOW
+
+    @property
     def light(self) -> str:
-        """Traffic light for this night: 🟢 go · 🟡 sky's fine but the
-        align-before-bed gate blocks it · 🔴 cloud / rain / wind."""
-        if self.qualifies:
+        """Traffic light for this night: 🟢 confident go · 🟡 qualifies but
+        speculative · 🔴 cloud / rain / wind / can't align before bed."""
+        if self.confident:
             return "🟢"
-        if self.sky_good_but_blocked:
+        if self.qualifies:
             return "🟡"
         return "🔴"
+
+    @property
+    def speculative_reason(self) -> str:
+        """Why a qualifying night is only 🟡."""
+        if self.best_run_len < CONFIDENT_MIN_RUN:
+            return "models disagree"
+        if self.strict_run_len < CONFIDENT_MIN_RUN:
+            return "heavy high cloud"
+        return "heavy high cloud at setup time"
 
     @property
     def usable_hours(self) -> int:
@@ -335,18 +381,6 @@ class NightScore:
         if self.tentative:
             return self.best_run_any_len, self.best_run_any_start
         return self.best_run_len, self.best_run_start
-
-    @property
-    def sky_good_but_blocked(self) -> bool:
-        """Clear, calm and dry — and ONLY the setup/align gate stops it
-        qualifying. Drives the amber 'weather's fine, timing isn't' light."""
-        return (
-            self.sky_ok
-            and not self.rain_vetoed
-            and not self.windy_vetoed
-            and REQUIRE_SETUP_WINDOW
-            and not self.setup_ok
-        )
 
 
 # --------------------------------------------------------------------------- #
@@ -518,6 +552,7 @@ def score_night(
     alignable_setup = [h for h in setup_hours if is_alignable(h.time)]
     setup_conf, setup_any = _usable_counts(alignable_setup)
     setup_ok = setup_conf >= SETUP_MIN_CLEAR_HOURS or setup_any >= SETUP_MIN_CLEAR_HOURS
+    setup_strict_ok = sum(h.usable_any_strict for h in alignable_setup) >= SETUP_MIN_CLEAR_HOURS
     clear_align_times = [h.time for h in alignable_setup if h.usable_any]
     setup_align_from = min(clear_align_times) if clear_align_times else None
     su_start, su_end = setup_window(night)
@@ -528,6 +563,7 @@ def score_night(
 
     best_run_len, best_run_start = _longest_run(confident_flags, times)
     best_run_any_len, best_run_any_start = _longest_run(any_flags, times)
+    strict_run_len, _ = _longest_run([h.usable_strict for h in dark_hours], times)
 
     def stats(layer: str) -> tuple[int, int] | None:
         vals = [h.layer(layer) for h in dark_hours if h.layer(layer) is not None]
@@ -567,6 +603,8 @@ def score_night(
         setup_ok=setup_ok,
         setup_alignable=len(alignable_setup),
         setup_align_from=setup_align_from,
+        strict_run_len=strict_run_len,
+        setup_strict_ok=setup_strict_ok,
     )
 
 
@@ -661,8 +699,13 @@ def _fmt_layer(stat: tuple[int, int] | None) -> str:
 
 
 def _mark(h: HourCloud) -> str:
-    """✓ both models say usable · ~ only one does · ✗ neither."""
-    return "✓" if h.usable_confident else ("~" if h.usable_any else "✗")
+    """✓ both models usable, high cloud modest · ◐ both usable but heavy high
+    cloud · ~ only one model usable · ✗ neither."""
+    if h.usable_strict:
+        return "✓"
+    if h.usable_confident:
+        return "◐"
+    return "~" if h.usable_any else "✗"
 
 
 def hour_strip(s: NightScore) -> str:
@@ -678,8 +721,13 @@ def format_night(s: NightScore, change: str | None = None, strip: bool = False) 
     window = f"{s.dark_start:%H:%M}–{s.dark_end:%H:%M}"
     total = len(s.dark_hours)
 
-    conf = ("tentative (single model / models disagree)" if s.tentative
-            else "high (both models agree)")
+    if s.light == "🟢":
+        conf = "🟢 confident"
+    elif s.light == "🟡":
+        conf = f"🟡 speculative — {s.speculative_reason}"
+    else:
+        conf = ("tentative (single model / models disagree)" if s.tentative
+                else "high (both models agree)")
     run_len, run_start = s.run
     run = f"best run {run_len}h from {run_start:%H:%M}" if run_len else "no usable run"
 
@@ -704,8 +752,10 @@ def format_night(s: NightScore, change: str | None = None, strip: bool = False) 
         f"high {_fmt_layer(s.layer_stats['high'])}"
     )
     high = s.layer_stats["high"]
-    if high is not None and high[0] >= HIGH_CLOUD_NOTE:
-        cloud += " — thin high cloud (ok for narrowband)"
+    if high is not None and high[0] > HIGH_CLOUD_CONFIDENT_MAX:
+        cloud += " — heavy high cloud (may be thick)"
+    elif high is not None and high[0] >= HIGH_CLOUD_NOTE:
+        cloud += " — some high cloud (ok for narrowband)"
     lines.append(cloud)
 
     prob = f"{s.rain_max_prob}%" if s.rain_max_prob is not None else "n/a"
@@ -739,15 +789,7 @@ def format_night(s: NightScore, change: str | None = None, strip: bool = False) 
     return "\n".join(lines)
 
 
-def verdict_light(scores: list[NightScore]) -> str:
-    """Traffic-light for the notification title, read at a glance on the banner:
-    🟢 a night qualifies · 🟡 sky's clear but only the align gate blocks it ·
-    🔴 genuinely clouded / rained / blown out."""
-    lights = {s.light for s in scores}
-    for light in ("🟢", "🟡"):
-        if light in lights:
-            return light
-    return "🔴"
+LIGHT_RANK = {"🔴": 0, "🟡": 1, "🟢": 2}
 
 
 def _reason(s: NightScore) -> str:
@@ -755,7 +797,10 @@ def _reason(s: NightScore) -> str:
     if s.qualifies:
         run_len, run_start = s.run
         frm = run_start.strftime("%H:%M") if run_start else "?"
-        return f"🟢 usable {s.usable_hours}h · best run {run_len}h from {frm}"
+        summary = f"usable {s.usable_hours}h · best run {run_len}h from {frm}"
+        if s.confident:
+            return f"🟢 {summary}"
+        return f"🟡 maybe ({s.speculative_reason}) · {summary}"
     if s.rain_vetoed:
         prob = f"{s.rain_max_prob}%" if s.rain_max_prob is not None else "n/a"
         return f"🌧 rain in the window ({prob}, {s.rain_max_mm:.1f}mm)"
@@ -778,14 +823,23 @@ def _outlook_line(s: NightScore, change: str | None) -> str:
     return f"{line}\n{change}" if change else line
 
 
+def _nights_title(nights: list[NightScore], one: str, many: str) -> str:
+    if len(nights) == 1:
+        return f"{one}: {nights[0].night.strftime('%a %-d %b')}"
+    return many.format(n=len(nights))
+
+
 def build_message(scores: list[NightScore], changes: dict[date, str | None]) -> tuple[str, str]:
-    """Morning alert: qualifying nights in full, the rest as short lines."""
-    qualifying = [s for s in scores if s.qualifies]
-    if len(qualifying) == 1:
-        title = f"🟢 Clear night: {qualifying[0].night.strftime('%a %-d %b')}"
+    """Morning alert: 🟢/🟡 nights in full, the rest as short lines."""
+    go = [s for s in scores if s.qualifies]
+    sure = [s for s in go if s.confident]
+    if sure:
+        title = _nights_title(sure, "🟢 Clear night", "🟢 {n} clear nights ahead")
+        if len(go) > len(sure):
+            title += f" (+{len(go) - len(sure)} maybe)"
     else:
-        title = f"🟢 {len(qualifying)} clear nights ahead"
-    parts = [format_night(s, changes.get(s.night)) for s in qualifying]
+        title = _nights_title(go, "🟡 Maybe", "🟡 {n} possible nights")
+    parts = [format_night(s, changes.get(s.night)) for s in go]
     parts += [_outlook_line(s, changes.get(s.night)) for s in scores if not s.qualifies]
     return title, "\n\n".join(parts)
 
@@ -795,12 +849,10 @@ def build_digest(
     changes: dict[date, str | None],
     downgraded: list[NightScore],
 ) -> tuple[str, str]:
-    light = verdict_light(scores)
+    """Nothing qualifies: a one-line reason per night."""
     if downgraded:
         days = ", ".join(s.night.strftime("%a") for s in downgraded)
-        title = f"{light} SkyGuard: {days} no longer clear"
-    elif light == "🟡":
-        title = "🟡 SkyGuard: clear — but not dark enough to align yet"
+        title = f"🔴 SkyGuard: {days} now off"
     else:
         title = f"🔴 SkyGuard: nothing on (next {len(scores)})"
     lines = ["No night qualifies right now — outlook:"]
@@ -809,25 +861,29 @@ def build_digest(
 
 
 def _short_reason(s: NightScore) -> str:
+    """Why a 🔴 night is off, in a few words for the title."""
     if s.rain_vetoed:
         return "rain forecast"
     if s.windy_vetoed:
         return "too windy"
+    if REQUIRE_SETUP_WINDOW and not s.setup_ok:
+        if s.setup_alignable == 0:
+            return "not dark enough to align before bed"
+        return "cloudy before bed"
     return "too cloudy"
 
 
 def build_tonight(s: NightScore, change: str | None, prev_light: str | None) -> tuple[str, str]:
-    """Evening update: go / no-go for tonight, with the hour-by-hour picture
-    and how it has moved since the last run."""
-    if s.qualifies:
+    """Evening update: go / maybe / no-go for tonight, with the hour-by-hour
+    picture and how it has moved since the last run."""
+    if s.light == "🟢":
         if REQUIRE_SETUP_WINDOW and s.setup_align_from:
             title = f"🟢 Tonight's on — set up from {s.setup_align_from:%H:%M}"
         else:
             start = s.run[1]
             title = f"🟢 Tonight's on — clear from {start:%H:%M}" if start else "🟢 Tonight's on"
-    elif s.sky_good_but_blocked:
-        title = ("🟡 Tonight: clear, but not dark enough to align before bed"
-                 if s.setup_alignable == 0 else "🟡 Tonight: clears, but not before bed")
+    elif s.light == "🟡":
+        title = f"🟡 Tonight's a maybe — {s.speculative_reason}"
     else:
         title = f"🔴 Tonight's off — {_short_reason(s)}"
     if prev_light and prev_light != s.light:
@@ -913,7 +969,7 @@ def score_nights(hours: list[HourCloud], count: int) -> list[NightScore]:
 def log_scores(scores: list[NightScore]) -> None:
     for s in scores:
         if s.qualifies:
-            marker = "QUALIFIES"
+            marker = "GO" if s.confident else "MAYBE"
         elif s.rain_vetoed:
             marker = "VETOED-rain"
         elif s.windy_vetoed:
@@ -969,9 +1025,13 @@ def main() -> int:
         runs.append(snap)
         if changes[s.night]:
             print(f"  {s.night}: {changes[s.night]}")
-    # A night that was 🟢 last run and isn't now is worth a push even when the
-    # digest is off — you may have planned around it.
-    downgraded = [s for s in scores if prev_light[s.night] == "🟢" and not s.qualifies]
+    # A night whose light has dropped since the last run (🟢→🟡, 🟡→🔴, …) is
+    # worth a push even when the digest is off — you may have planned around it.
+    downgraded = [
+        s for s in scores
+        if prev_light[s.night] in LIGHT_RANK
+        and LIGHT_RANK[prev_light[s.night]] > LIGHT_RANK[s.light]
+    ]
 
     message: tuple[str, str] | None = None
     if RUN_MODE == "tonight":
