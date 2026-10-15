@@ -1,10 +1,15 @@
 #!/usr/bin/env python3
 """SkyGuard — clear-night forecast alert.
 
-Runs once each morning, pulls the next few nights of cloud forecast for a
-configured location from Open-Meteo (one primary model, one cross-check),
+Runs each morning (the "outlook": the next few nights) and again each evening
+(the "tonight" update: a fresher look at just tonight). Pulls cloud forecast for
+a configured location from Open-Meteo (one primary model, one cross-check),
 evaluates only the hours of real darkness (nautical night), and sends a single
 Pushover push if a night looks usable. Silent otherwise.
+
+Each run's verdict per night is kept in a small history file, so the push can
+say how the forecast for a night has moved since the previous run (🔴→🟢, low
+cloud 60→15%, …) and warn when a night that looked good no longer does.
 
 Cloud is judged by LAYER, not as one lumped total. Low cloud is the real gate
 for astrophotography — it's opaque. Mid cloud also blocks. High cloud (cirrus)
@@ -19,11 +24,13 @@ to print the message to stdout instead of pushing.
 
 from __future__ import annotations
 
+import json
 import math
 import os
 import sys
 from dataclasses import dataclass
-from datetime import date, datetime, time, timedelta
+from datetime import date, datetime, time, timedelta, timezone
+from pathlib import Path
 from zoneinfo import ZoneInfo
 
 import requests
@@ -60,6 +67,27 @@ TWILIGHT_DEPRESSION = 12.0
 
 # How many upcoming nights to evaluate (tonight = night 1).
 NIGHTS_AHEAD = 3
+
+# Run mode. "outlook" (default, the morning run) scores the next NIGHTS_AHEAD
+# nights. "tonight" (the evening run) re-scores just tonight with the freshest
+# model runs and always shows the hour-by-hour picture.
+RUN_MODE = _env("RUN_MODE", "outlook").lower()
+
+# Local hour the evening "tonight" update is meant for. The scheduler (cron) is
+# in UTC, so the workflow fires two UTC slots to cover daylight saving and the
+# run whose scheduled time lands on this local hour goes ahead; the other skips.
+EVENING_HOUR = 18
+
+# Forecast history. Every run records a compact verdict per night here, and the
+# next run compares against it to report what changed. Pruned automatically.
+# In GitHub Actions this file is carried between runs by the Actions cache.
+STATE_FILE = Path(_env("STATE_FILE", ".skyguard/state.json"))
+STATE_KEEP_RUNS = 6  # snapshots kept per night
+
+# What counts as a change worth mentioning (smaller wobbles are ignored).
+CHANGE_HOURS = 2       # usable hours
+CHANGE_CLOUD_PTS = 15  # low / mid cloud average, percentage points
+CHANGE_GUST_KMH = 10   # peak gust
 
 # Daily digest. When True, SkyGuard sends a short status on EVERY run — the
 # clear-night alert when a night qualifies, otherwise a "nothing tonight, here's
@@ -153,6 +181,7 @@ FORECAST_DAYS = NIGHTS_AHEAD + 1
 
 OPEN_METEO_URL = "https://api.open-meteo.com/v1/forecast"
 PUSHOVER_URL = "https://api.pushover.net/1/messages.json"
+PUSHOVER_MAX_CHARS = 1024  # Pushover's message length limit
 
 TZ = ZoneInfo(TIMEZONE)
 OBSERVER = LocationInfo("site", "", TIMEZONE, LATITUDE, LONGITUDE).observer
@@ -285,6 +314,27 @@ class NightScore:
         if REQUIRE_SETUP_WINDOW and not self.setup_ok:
             return False  # can't deploy + polar align before bed → not actionable
         return self.sky_ok
+
+    @property
+    def light(self) -> str:
+        """Traffic light for this night: 🟢 go · 🟡 sky's fine but the
+        align-before-bed gate blocks it · 🔴 cloud / rain / wind."""
+        if self.qualifies:
+            return "🟢"
+        if self.sky_good_but_blocked:
+            return "🟡"
+        return "🔴"
+
+    @property
+    def usable_hours(self) -> int:
+        return self.any_usable_hours if self.tentative else self.confident_usable_hours
+
+    @property
+    def run(self) -> tuple[int, datetime | None]:
+        """(length, start) of the best usable run at this night's confidence."""
+        if self.tentative:
+            return self.best_run_any_len, self.best_run_any_start
+        return self.best_run_len, self.best_run_start
 
     @property
     def sky_good_but_blocked(self) -> bool:
@@ -521,6 +571,85 @@ def score_night(
 
 
 # --------------------------------------------------------------------------- #
+# Forecast history — what changed since the last run                          #
+# --------------------------------------------------------------------------- #
+
+def load_state() -> dict:
+    try:
+        return json.loads(STATE_FILE.read_text())
+    except (FileNotFoundError, ValueError):
+        return {}
+
+
+def save_state(state: dict, today: date) -> None:
+    """Write the history, dropping nights that are over and old snapshots."""
+    keep_from = (today - timedelta(days=1)).isoformat()
+    state["nights"] = {
+        night: runs[-STATE_KEEP_RUNS:]
+        for night, runs in state.get("nights", {}).items()
+        if night >= keep_from
+    }
+    STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
+    STATE_FILE.write_text(json.dumps(state, indent=1, ensure_ascii=False))
+
+
+def snapshot(s: NightScore, at: datetime) -> dict:
+    """The compact per-night record kept in the history."""
+    low, mid = s.layer_stats["low"], s.layer_stats["mid"]
+    return {
+        "at": at.isoformat(timespec="minutes"),
+        "mode": RUN_MODE,
+        "light": s.light,
+        "usable": s.usable_hours,
+        "low": low[0] if low else None,
+        "mid": mid[0] if mid else None,
+        "rain_mm": round(s.rain_max_mm, 1),
+        "gust": s.gust_max_kmh,
+    }
+
+
+def _when(stamp: str, now: datetime) -> str:
+    """'this morning' / 'yesterday evening' / 'Tue 18:00' for a history stamp."""
+    t = datetime.fromisoformat(stamp).astimezone(TZ)
+    part = "morning" if t.hour < 12 else "afternoon" if t.hour < 17 else "evening"
+    days = (now.date() - t.date()).days
+    if days == 0:
+        return f"this {part}"
+    if days == 1:
+        return f"yesterday {part}"
+    return f"{t:%a %H:%M}"
+
+
+def _delta(label: str, old, new, threshold: int, unit: str = "") -> str | None:
+    if old is None or new is None or abs(new - old) < threshold:
+        return None
+    return f"{label} {old}→{new}{unit}"
+
+
+def describe_change(history: list[dict], cur: dict, now: datetime) -> str | None:
+    """One line on how this night's forecast has moved since the previous run,
+    or None when there's no earlier run to compare with."""
+    if not history:
+        return None
+    prev = history[-1]
+    moved = [d for d in (
+        _delta("usable", prev.get("usable"), cur["usable"], CHANGE_HOURS, "h"),
+        _delta("low", prev.get("low"), cur["low"], CHANGE_CLOUD_PTS, "%"),
+        _delta("mid", prev.get("mid"), cur["mid"], CHANGE_CLOUD_PTS, "%"),
+        _delta("gusts", prev.get("gust"), cur["gust"], CHANGE_GUST_KMH),
+    ) if d]
+    old_mm, new_mm = prev.get("rain_mm"), cur["rain_mm"]
+    if old_mm is not None and (old_mm > PRECIP_AMOUNT_MAX) != (new_mm > PRECIP_AMOUNT_MAX):
+        moved.append(f"rain {old_mm:.1f}→{new_mm:.1f}mm")
+
+    trend = "".join(h["light"] for h in history[-3:]) + "→" + cur["light"]
+    when = _when(prev["at"], now)
+    if prev["light"] == cur["light"] and not moved:
+        return f"↻ {trend} unchanged since {when}"
+    return f"↻ {trend} since {when}" + (" · " + " · ".join(moved) if moved else "")
+
+
+# --------------------------------------------------------------------------- #
 # Message + delivery                                                           #
 # --------------------------------------------------------------------------- #
 
@@ -531,28 +660,43 @@ def _fmt_layer(stat: tuple[int, int] | None) -> str:
     return f"{avg}%" if avg == peak else f"{avg}% (peak {peak}%)"
 
 
-def format_night(s: NightScore) -> str:
+def _mark(h: HourCloud) -> str:
+    """✓ both models say usable · ~ only one does · ✗ neither."""
+    return "✓" if h.usable_confident else ("~" if h.usable_any else "✗")
+
+
+def hour_strip(s: NightScore) -> str:
+    """The whole dark window hour by hour, compactly: 21✓ 22✓ 23~ 00✗ …"""
+    return " ".join(f"{h.time:%H}{_mark(h)}" for h in s.dark_hours)
+
+
+def format_night(s: NightScore, change: str | None = None, strip: bool = False) -> str:
+    """Full per-night block. Truthful for any night, not just qualifying ones
+    (the evening update shows tonight whatever the verdict). `strip` adds the
+    compact hour-by-hour line when the night is too long for per-hour detail."""
     day = s.night.strftime("%a %-d %b")
     window = f"{s.dark_start:%H:%M}–{s.dark_end:%H:%M}"
     total = len(s.dark_hours)
 
-    if s.tentative:
-        usable, run_len, run_start = s.any_usable_hours, s.best_run_any_len, s.best_run_any_start
-        conf = "tentative (single model / models disagree)"
-    else:
-        usable, run_len, run_start = s.confident_usable_hours, s.best_run_len, s.best_run_start
-        conf = "high (both models agree)"
-    run_from = run_start.strftime("%H:%M") if run_start else "?"
+    conf = ("tentative (single model / models disagree)" if s.tentative
+            else "high (both models agree)")
+    run_len, run_start = s.run
+    run = f"best run {run_len}h from {run_start:%H:%M}" if run_len else "no usable run"
 
     lines = [
         f"<b>{day}</b> · dark {window} · Moon {s.moon_illum}% ({s.moon_label})",
-        f"{usable}/{total} h usable · best run {run_len}h from {run_from} · conf: {conf}",
+        f"{s.usable_hours}/{total} h usable · {run} · conf: {conf}",
     ]
 
     if REQUIRE_SETUP_WINDOW:
-        frm = s.setup_align_from.strftime("%H:%M") if s.setup_align_from else "?"
-        setup_tag = "" if s.setup_usable_confident >= SETUP_MIN_CLEAR_HOURS else " (tentative)"
-        lines.append(f"✅ set up &amp; align from {frm} — dark + clear before bed{setup_tag}")
+        if s.setup_ok:
+            frm = s.setup_align_from.strftime("%H:%M") if s.setup_align_from else "?"
+            setup_tag = "" if s.setup_usable_confident >= SETUP_MIN_CLEAR_HOURS else " (tentative)"
+            lines.append(f"✅ set up &amp; align from {frm} — dark + clear before bed{setup_tag}")
+        elif s.setup_alignable == 0:
+            lines.append(f"🌆 not dark enough to align before bed ({s.setup_window})")
+        else:
+            lines.append(f"☁ no clear hour to set up &amp; align ({s.setup_window})")
 
     cloud = (
         f"low {_fmt_layer(s.layer_stats['low'])} · "
@@ -565,23 +709,33 @@ def format_night(s: NightScore) -> str:
     lines.append(cloud)
 
     prob = f"{s.rain_max_prob}%" if s.rain_max_prob is not None else "n/a"
-    lines.append(
-        f"rain {s.exposure_window}: dry (max chance {prob}, max {s.rain_max_mm:.1f}mm)"
-    )
+    if s.rain_vetoed:
+        lines.append(
+            f"🌧 rain {s.exposure_window}: chance up to {prob}, max {s.rain_max_mm:.1f}mm"
+        )
+    else:
+        lines.append(
+            f"rain {s.exposure_window}: dry (max chance {prob}, max {s.rain_max_mm:.1f}mm)"
+        )
 
-    breezy = (s.gust_max_kmh > WIND_GUST_WARN_KMH
-              or s.wind_max_kmh > WIND_SUSTAINED_WARN_KMH)
     wind_line = f"wind: {s.wind_max_kmh} km/h, gusts {s.gust_max_kmh} km/h"
-    lines.append(wind_line + " ⚠ breezy" if breezy else wind_line)
+    if s.windy_vetoed:
+        wind_line += " 💨 too windy"
+    elif s.gust_max_kmh > WIND_GUST_WARN_KMH or s.wind_max_kmh > WIND_SUSTAINED_WARN_KMH:
+        wind_line += " ⚠ breezy"
+    lines.append(wind_line)
 
     if total <= MAX_HOURLY_DETAIL:
         for h in s.dark_hours:
-            mark = "✓" if h.usable_confident else ("~" if h.usable_any else "✗")
             lines.append(
                 f"{h.time:%H:%M} · low {h.layer('low')}% "
-                f"mid {h.layer('mid')}% high {h.layer('high')}% {mark}"
+                f"mid {h.layer('mid')}% high {h.layer('high')}% {_mark(h)}"
             )
+    elif strip:
+        lines.append(hour_strip(s))
 
+    if change:
+        lines.append(change)
     return "\n".join(lines)
 
 
@@ -589,31 +743,19 @@ def verdict_light(scores: list[NightScore]) -> str:
     """Traffic-light for the notification title, read at a glance on the banner:
     🟢 a night qualifies · 🟡 sky's clear but only the align gate blocks it ·
     🔴 genuinely clouded / rained / blown out."""
-    if any(s.qualifies for s in scores):
-        return "🟢"
-    if any(s.sky_good_but_blocked for s in scores):
-        return "🟡"
+    lights = {s.light for s in scores}
+    for light in ("🟢", "🟡"):
+        if light in lights:
+            return light
     return "🔴"
-
-
-def build_message(qualifying: list[NightScore]) -> tuple[str, str]:
-    if len(qualifying) == 1:
-        title = f"🟢 Clear night: {qualifying[0].night.strftime('%a %-d %b')}"
-    else:
-        title = f"🟢 {len(qualifying)} clear nights ahead"
-    body = "\n\n".join(format_night(s) for s in qualifying)
-    return title, body
 
 
 def _reason(s: NightScore) -> str:
     """One-line human verdict for the daily digest."""
     if s.qualifies:
-        tentative = s.tentative
-        hrs = s.any_usable_hours if tentative else s.confident_usable_hours
-        run = s.best_run_any_len if tentative else s.best_run_len
-        start = s.best_run_any_start if tentative else s.best_run_start
-        frm = start.strftime("%H:%M") if start else "?"
-        return f"🟢 usable {hrs}h · best run {run}h from {frm}"
+        run_len, run_start = s.run
+        frm = run_start.strftime("%H:%M") if run_start else "?"
+        return f"🟢 usable {s.usable_hours}h · best run {run_len}h from {frm}"
     if s.rain_vetoed:
         prob = f"{s.rain_max_prob}%" if s.rain_max_prob is not None else "n/a"
         return f"🌧 rain in the window ({prob}, {s.rain_max_mm:.1f}mm)"
@@ -627,22 +769,82 @@ def _reason(s: NightScore) -> str:
     return f"☁ too cloudy (low {low[0] if low else '?'}%)"
 
 
-def build_digest(scores: list[NightScore]) -> tuple[str, str]:
+def _outlook_line(s: NightScore, change: str | None) -> str:
+    """Short per-night entry: date, moon, verdict and what changed."""
+    day = s.night.strftime("%a %-d %b")
+    windy = s.gust_max_kmh > WIND_GUST_WARN_KMH and not s.windy_vetoed
+    extra = f" · 💨 gusts {s.gust_max_kmh}" if windy else ""
+    line = f"<b>{day}</b> · Moon {s.moon_illum}%{extra}\n{_reason(s)}"
+    return f"{line}\n{change}" if change else line
+
+
+def build_message(scores: list[NightScore], changes: dict[date, str | None]) -> tuple[str, str]:
+    """Morning alert: qualifying nights in full, the rest as short lines."""
+    qualifying = [s for s in scores if s.qualifies]
+    if len(qualifying) == 1:
+        title = f"🟢 Clear night: {qualifying[0].night.strftime('%a %-d %b')}"
+    else:
+        title = f"🟢 {len(qualifying)} clear nights ahead"
+    parts = [format_night(s, changes.get(s.night)) for s in qualifying]
+    parts += [_outlook_line(s, changes.get(s.night)) for s in scores if not s.qualifies]
+    return title, "\n\n".join(parts)
+
+
+def build_digest(
+    scores: list[NightScore],
+    changes: dict[date, str | None],
+    downgraded: list[NightScore],
+) -> tuple[str, str]:
     light = verdict_light(scores)
-    if light == "🟡":
+    if downgraded:
+        days = ", ".join(s.night.strftime("%a") for s in downgraded)
+        title = f"{light} SkyGuard: {days} no longer clear"
+    elif light == "🟡":
         title = "🟡 SkyGuard: clear — but not dark enough to align yet"
     else:
         title = f"🔴 SkyGuard: nothing on (next {len(scores)})"
     lines = ["No night qualifies right now — outlook:"]
-    for s in scores:
-        day = s.night.strftime("%a %-d %b")
-        windy = s.gust_max_kmh > WIND_GUST_WARN_KMH and not s.windy_vetoed
-        extra = f" · 💨 gusts {s.gust_max_kmh}" if windy else ""
-        lines.append(f"<b>{day}</b> · Moon {s.moon_illum}%{extra}\n{_reason(s)}")
+    lines += [_outlook_line(s, changes.get(s.night)) for s in scores]
     return title, "\n\n".join(lines)
 
 
+def _short_reason(s: NightScore) -> str:
+    if s.rain_vetoed:
+        return "rain forecast"
+    if s.windy_vetoed:
+        return "too windy"
+    return "too cloudy"
+
+
+def build_tonight(s: NightScore, change: str | None, prev_light: str | None) -> tuple[str, str]:
+    """Evening update: go / no-go for tonight, with the hour-by-hour picture
+    and how it has moved since the last run."""
+    if s.qualifies:
+        if REQUIRE_SETUP_WINDOW and s.setup_align_from:
+            title = f"🟢 Tonight's on — set up from {s.setup_align_from:%H:%M}"
+        else:
+            start = s.run[1]
+            title = f"🟢 Tonight's on — clear from {start:%H:%M}" if start else "🟢 Tonight's on"
+    elif s.sky_good_but_blocked:
+        title = ("🟡 Tonight: clear, but not dark enough to align before bed"
+                 if s.setup_alignable == 0 else "🟡 Tonight: clears, but not before bed")
+    else:
+        title = f"🔴 Tonight's off — {_short_reason(s)}"
+    if prev_light and prev_light != s.light:
+        title += f" (was {prev_light})"
+    return title, format_night(s, change, strip=True)
+
+
+def _fit(message: str) -> str:
+    """Trim to Pushover's length limit at a line break, so no tag is cut."""
+    if len(message) <= PUSHOVER_MAX_CHARS:
+        return message
+    cut = message.rfind("\n", 0, PUSHOVER_MAX_CHARS - 2)
+    return message[:cut if cut > 0 else PUSHOVER_MAX_CHARS - 2] + "\n…"
+
+
 def send_pushover(title: str, message: str) -> None:
+    message = _fit(message)
     token = os.environ.get("PUSHOVER_TOKEN")
     user = os.environ.get("PUSHOVER_USER")
     if os.environ.get("DRY_RUN") or not (token and user):
@@ -669,12 +871,23 @@ def send_pushover(title: str, message: str) -> None:
 # Main                                                                         #
 # --------------------------------------------------------------------------- #
 
-def main() -> int:
-    hours = fetch_forecast()
-    if not hours:
-        print("No forecast data returned.")
-        return 0
+def evening_slot_due() -> bool:
+    """For the evening run: True when the cron slot that fired lands on
+    EVENING_HOUR local today. The workflow fires two UTC slots so that one of
+    them is EVENING_HOUR local in both summer and winter time; this picks it.
+    Uses the SCHEDULED slot (not the clock), so a late-starting run still
+    counts. Manual and local runs (no SCHEDULE) always go ahead."""
+    fields = os.environ.get("SCHEDULE", "").split()
+    if len(fields) < 2 or not (fields[0].isdigit() and fields[1].isdigit()):
+        return True
+    slot = datetime.now(timezone.utc).replace(
+        hour=int(fields[1]), minute=int(fields[0]), second=0, microsecond=0
+    )
+    return slot.astimezone(TZ).hour == EVENING_HOUR
 
+
+def score_nights(hours: list[HourCloud], count: int) -> list[NightScore]:
+    """Score `count` nights starting with tonight."""
     by_night: dict[date, list[HourCloud]] = {}
     for h in hours:
         if is_dark(h.time):
@@ -682,7 +895,7 @@ def main() -> int:
 
     today = hours[0].time.date()
     scores: list[NightScore] = []
-    for i in range(NIGHTS_AHEAD):
+    for i in range(count):
         night = today + timedelta(days=i)
         dark_hours = by_night.get(night)
         if not dark_hours:
@@ -694,7 +907,10 @@ def main() -> int:
         s = score_night(night, dark_hours, exposure_hours, setup_hours)
         if s is not None:
             scores.append(s)
+    return scores
 
+
+def log_scores(scores: list[NightScore]) -> None:
     for s in scores:
         if s.qualifies:
             marker = "QUALIFIES"
@@ -719,16 +935,63 @@ def main() -> int:
             f"moon {s.moon_illum}%"
         )
 
-    qualifying = [s for s in scores if s.qualifies]
-    if qualifying:
-        title, message = build_message(qualifying)
-        send_pushover(title, message)
+
+def main() -> int:
+    if RUN_MODE not in ("outlook", "tonight"):
+        print(f"Unknown RUN_MODE {RUN_MODE!r} — use 'outlook' or 'tonight'.")
+        return 1
+    if RUN_MODE == "tonight" and not evening_slot_due():
+        print(f"This slot isn't {EVENING_HOUR}:00 local today (daylight-saving twin) — skipping.")
         return 0
-    if DAILY_DIGEST and scores:
-        title, message = build_digest(scores)
-        send_pushover(title, message)
+
+    hours = fetch_forecast()
+    if not hours:
+        print("No forecast data returned.")
         return 0
-    print("No qualifying nights — staying silent.")
+
+    scores = score_nights(hours, 1 if RUN_MODE == "tonight" else NIGHTS_AHEAD)
+    log_scores(scores)
+    if not scores:
+        print("No dark hours to score.")
+        return 0
+
+    # Compare each night with the previous run's verdict, then record this one.
+    now = datetime.now(TZ)
+    state = load_state()
+    history = state.setdefault("nights", {})
+    changes: dict[date, str | None] = {}
+    prev_light: dict[date, str | None] = {}
+    for s in scores:
+        runs = history.setdefault(s.night.isoformat(), [])
+        snap = snapshot(s, now)
+        changes[s.night] = describe_change(runs, snap, now)
+        prev_light[s.night] = runs[-1]["light"] if runs else None
+        runs.append(snap)
+        if changes[s.night]:
+            print(f"  {s.night}: {changes[s.night]}")
+    # A night that was 🟢 last run and isn't now is worth a push even when the
+    # digest is off — you may have planned around it.
+    downgraded = [s for s in scores if prev_light[s.night] == "🟢" and not s.qualifies]
+
+    message: tuple[str, str] | None = None
+    if RUN_MODE == "tonight":
+        tonight = scores[0]
+        if tonight.qualifies or downgraded or DAILY_DIGEST:
+            message = build_tonight(tonight, changes[tonight.night], prev_light[tonight.night])
+    elif any(s.qualifies for s in scores):
+        message = build_message(scores, changes)
+    elif downgraded or DAILY_DIGEST:
+        message = build_digest(scores, changes, downgraded)
+
+    if message:
+        send_pushover(*message)
+    else:
+        print("No qualifying nights and nothing downgraded — staying silent.")
+
+    if os.environ.get("DRY_RUN"):
+        print("[dry-run] forecast history not updated.")
+    else:
+        save_state(state, now.date())
     return 0
 
 

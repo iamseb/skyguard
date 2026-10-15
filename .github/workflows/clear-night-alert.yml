@@ -2,14 +2,30 @@ name: SkyGuard — Clear Night Alert
 
 on:
   schedule:
-    # 06:00 UTC = 08:00 local (CEST). Adjust the hour to taste; cron is UTC.
+    # Morning outlook (next few nights). 06:00 UTC = 08:00 CEST / 07:00 CET.
     - cron: "0 6 * * *"
+    # Evening update for tonight at 18:00 local (EVENING_HOUR in main.py). Cron
+    # is UTC and doesn't follow daylight saving, so fire both candidate slots —
+    # 16:00 UTC = 18:00 CEST, 17:00 UTC = 18:00 CET — and the script only runs
+    # the one that lands on 18:00 local, skipping its twin.
+    - cron: "0 16 * * *"
+    - cron: "0 17 * * *"
   workflow_dispatch:
     inputs:
+      mode:
+        description: "outlook = next few nights (morning) · tonight = evening update"
+        type: choice
+        options: [outlook, tonight]
+        default: outlook
       dry_run:
         description: "Print the message instead of sending a push"
         type: boolean
         default: false
+
+# Never let two runs race on the forecast history.
+concurrency:
+  group: skyguard
+  cancel-in-progress: false
 
 jobs:
   alert:
@@ -20,6 +36,15 @@ jobs:
         with:
           python-version: "3.12"
       - run: pip install -r requirements.txt
+      # Forecast history (per-night verdicts from earlier runs) lives in the
+      # Actions cache, not the repo, so nothing about the site is committed.
+      # Each run restores the newest copy and saves a fresh one.
+      - name: Restore forecast history
+        uses: actions/cache/restore@v4
+        with:
+          path: .skyguard
+          key: skyguard-state-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: skyguard-state-
       - run: python main.py
         env:
           PUSHOVER_TOKEN: ${{ secrets.PUSHOVER_TOKEN }}
@@ -33,4 +58,13 @@ jobs:
           # every day (not just on clear nights). Not sensitive, so a Variable
           # rather than a Secret. Unset = silent unless a night qualifies.
           DAILY_DIGEST: ${{ vars.DAILY_DIGEST }}
+          # The morning cron is the outlook; the evening crons are "tonight".
+          RUN_MODE: ${{ inputs.mode || (github.event.schedule == '0 6 * * *' && 'outlook' || 'tonight') }}
+          SCHEDULE: ${{ github.event.schedule }}
           DRY_RUN: ${{ inputs.dry_run && '1' || '' }}
+      - name: Save forecast history
+        if: hashFiles('.skyguard/state.json') != ''
+        uses: actions/cache/save@v4
+        with:
+          path: .skyguard
+          key: skyguard-state-${{ github.run_id }}-${{ github.run_attempt }}

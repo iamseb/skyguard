@@ -1,7 +1,8 @@
 # SkyGuard — Clear Night Alert
 
-A passive, once-a-day push that tells you when an upcoming night is worth setting
-up for. No dashboard to check — silent unless a night clears the threshold, or
+A passive push that tells you when an upcoming night is worth setting up for —
+a morning **outlook** for the next few nights, then an **evening update** at 18:00
+that re-checks just tonight with the freshest model runs. No dashboard to check — silent unless a night clears the threshold, or
 turn on `DAILY_DIGEST` for a short status **every** day (so you also know it's
 running, and why nothing's on when it isn't).
 
@@ -64,6 +65,23 @@ a night looks usable.
   outlook (and why)" summary with a one-line reason per night (🟢 usable / 🌧 rain /
   💨 too windy / 🌆 not dark enough to align before bed / ☁ too cloudy). Handy as a
   daily heartbeat that confirms the job is running.
+- **Evening update (tonight)**: forecasts sharpen as the night gets closer — the
+  high-resolution model re-runs hourly, so by 18:00 it is ~10 hours fresher than
+  the morning outlook. The evening run re-scores **tonight only** and gives a
+  go / no-go: "🟢 Tonight's on — set up from 21:00", "🔴 Tonight's off — rain
+  forecast (was 🟢)", with an hour-by-hour strip for the whole dark window
+  (`21✓ 22✓ 23~ 00✗ …`). It follows the same rules as the morning run: it pushes
+  when tonight qualifies, when tonight *was* 🟢 and no longer is, or every time if
+  `DAILY_DIGEST` is on.
+- **Forecast history (what changed)**: every run records a compact verdict per
+  night (light, usable hours, low/mid cloud, rain, gusts), and the next run
+  compares against it. Each night in the push then carries a line such as
+  `↻ 🔴🟡→🟢 since yesterday evening · usable 1→6h · low 60→15%`, or
+  `↻ 🟢🟢→🟢 unchanged since this morning` — a forecast that holds steady across
+  several runs is one you can trust more. Small wobbles are ignored
+  (`CHANGE_HOURS`, `CHANGE_CLOUD_PTS`, `CHANGE_GUST_KMH`). A night that was 🟢 and
+  has since dropped **always** triggers a push, even with the digest off, so you're
+  never left planning around a stale forecast.
 - **Traffic-light title**: every notification's title leads with a light you can
   read from the lock screen — **🟢** a night qualifies (go), **🟡** the sky's clear
   but only the align-before-bed/darkness gate blocks it (weather's on your side,
@@ -105,7 +123,15 @@ above this reject the night; set very high to disable the veto).
 
 **Daily digest** — `DAILY_DIGEST` (environment variable / Actions Variable): `1`
 (or `true`/`yes`/`on`) to send a status every run; unset or `0` to stay silent
-unless a night qualifies.
+unless a night qualifies (or a 🟢 night drops).
+
+**Run mode** — `RUN_MODE` (environment): `outlook` (default; the next
+`NIGHTS_AHEAD` nights) or `tonight` (the evening update). `EVENING_HOUR` (in
+`CONFIG`, default 18) is the local hour the evening run is meant for.
+
+**History** — `STATE_FILE` (environment; default `.skyguard/state.json`) is where
+the per-night verdicts are kept between runs. Pruned automatically to the last
+`STATE_KEEP_RUNS` runs of nights that haven't happened yet.
 
 ## Setup (GitHub Action)
 
@@ -121,8 +147,17 @@ unless a night qualifies.
    - `DAILY_DIGEST` = `1` — send a short status every day (not just on clear
      nights), so you always know the job ran. Leave unset to stay silent unless a
      night qualifies. It's a Variable, not a Secret, because it isn't sensitive.
-4. The workflow in `.github/workflows/clear-night-alert.yml` runs daily at 06:00
-   UTC. Edit the `cron` line to change the time (cron is always UTC).
+4. The workflow in `.github/workflows/clear-night-alert.yml` runs the **outlook**
+   daily at 06:00 UTC and the **evening update** at 18:00 local. Cron is always UTC
+   and ignores daylight saving, so the evening has *two* cron lines (16:00 and
+   17:00 UTC — 18:00 in Central European summer and winter time); the script runs
+   whichever one lands on `EVENING_HOUR` local that day and skips the other. For
+   another timezone, set those two lines to the UTC hours that are 18:00 local in
+   summer and in winter.
+5. **History** is carried between runs in the GitHub Actions cache (restored at the
+   start of each run, saved at the end) — nothing is committed to the repo. If the
+   cache is ever lost, the next run simply has nothing to compare against and
+   starts a fresh history.
 
 ## Test it
 
@@ -136,9 +171,12 @@ LATITUDE=51.48 LONGITUDE=-0.0 TIMEZONE=Europe/London \
 ```
 
 It prints the per-night scores and the message it *would* send. Add `DAILY_DIGEST=1`
-to preview the daily-digest message even when no night qualifies. You can also
-trigger the workflow manually from the Actions tab ("Run workflow") with the
-dry-run box ticked.
+to preview the daily-digest message even when no night qualifies, and
+`RUN_MODE=tonight` to preview the evening update. A dry run leaves the history
+untouched; run without `DRY_RUN` (and without Pushover credentials, so it only
+prints) to record a run and see the `↻` change lines on the next one. You can
+also trigger the workflow manually from the Actions tab ("Run workflow"), picking
+the mode and ticking the dry-run box.
 
 ## Tuning notes
 
