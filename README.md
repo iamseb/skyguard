@@ -26,13 +26,14 @@ a night looks usable.
   *confident* the verdict is (see **Confidence tiers**). This avoids the
   over-pessimism of tools that gate on total cloud, which inflates with harmless
   cirrus.
-- **Rain is a hard veto**: rain ruins the gear, not just the session. A night is
-  rejected outright if any hour in the **equipment-exposure window** (the gear is
-  outside, default 21:00–09:00 — wider than the dark hours) has forecast rain
-  above `PRECIP_AMOUNT_MAX` mm **or** a rain chance ≥ `PRECIP_PROB_MAX` %, in
-  *either* model. (Probability is noisy — often a few % on dry nights, and some
-  models provide none — so the % cap sits well above zero while the mm test
-  catches actually-forecast rain.)
+- **Rain is a hard veto, with zero tolerance**: rain ruins the gear, not just the
+  session. A night is rejected outright if any hour in the **equipment-exposure
+  window** (the gear is outside, default 18:00–09:00 — wider than the dark hours)
+  has forecast rain above `PRECIP_AMOUNT_MAX` mm (default 0.0) **or** a rain
+  chance above `PRECIP_PROB_MAX` % (default 0), in *either* model. It fails safe:
+  an hour with no rain amount or no rain probability from any model counts as
+  wet. Not every model publishes a probability (KNMI HARMONIE doesn't; ECMWF
+  does), so at least one configured model must, or every night is vetoed.
 - **Wind (gusts are the spoiler)**: gusts shake the scope and trail subs far more
   than steady wind, so SkyGuard gates on gusts. Over the exposure window (worst
   value in either model), sustained wind above `WIND_SUSTAINED_WARN_KMH` (default

@@ -126,17 +126,19 @@ HIGH_CLOUD_NOTE = 40  # average high cloud above this gets a note in the push
 CONFIDENT_MIN_RUN = 2
 HIGH_CLOUD_CONFIDENT_MAX = 60
 
-# Precipitation veto. Rain on the kit is a hard no, so the night is rejected if
-# ANY hour in the equipment-exposure window has forecast rain above
-# PRECIP_AMOUNT_MAX mm OR a rain probability at/above PRECIP_PROB_MAX %, in
-# EITHER model. The window is the hours the gear is physically outside — wider
-# than the dark hours. NB: forecast probability is noisy (often a few % even on
-# bone-dry nights, and some models give no probability at all), which is why the
-# probability cap is well above zero; the mm test catches actually-forecast rain.
-EXPOSURE_START_HOUR = 21   # gear goes out
+# Precipitation veto. Rain on the kit is a hard no — there is no acceptable
+# chance of it — so the night is rejected if ANY hour in the equipment-exposure
+# window has forecast rain above PRECIP_AMOUNT_MAX mm OR a rain probability above
+# PRECIP_PROB_MAX %, in EITHER model. The window is the hours the gear is
+# physically outside — wider than the dark hours. It fails safe: an hour with no
+# amount or no probability from any model (or missing from the forecast) counts
+# as wet, because unknown is not dry. Not every model publishes a probability
+# (KNMI HARMONIE doesn't; ECMWF does), so at least one configured model must,
+# or every night is vetoed.
+EXPOSURE_START_HOUR = 18   # gear goes out (or must stay dry from)
 EXPOSURE_END_HOUR = 9      # gear comes in (next morning)
 PRECIP_AMOUNT_MAX = 0.0    # mm; any forecast rain above this vetoes the night
-PRECIP_PROB_MAX = 30       # %; rain chance at/above this vetoes the night
+PRECIP_PROB_MAX = 0        # %; any rain chance above this vetoes the night
 
 # Wind. Gusts shake the scope and trail subs far more than steady wind, so gusts
 # are what we gate on. A small refractor on a stiff pier in a sheltered garden
@@ -246,12 +248,18 @@ class HourCloud:
         return max(vals) if vals else 0.0
 
     @property
+    def rain_unknown(self) -> bool:
+        """True if no model gives a rain amount, or none gives a probability."""
+        return (all(v is None for v in self.precip_mm.values())
+                or all(v is None for v in self.precip_prob.values()))
+
+    @property
     def wet(self) -> bool:
-        """True if either model forecasts rain above the amount or probability cap."""
-        if self.max_precip_mm > PRECIP_AMOUNT_MAX:
+        """True if either model forecasts rain above the amount or probability
+        cap — or if the rain forecast is incomplete (fail safe)."""
+        if self.rain_unknown or self.max_precip_mm > PRECIP_AMOUNT_MAX:
             return True
-        prob = self.max_precip_prob
-        return prob is not None and prob >= PRECIP_PROB_MAX
+        return self.max_precip_prob > PRECIP_PROB_MAX
 
     @staticmethod
     def _usable(layers: dict[str, int | None], strict: bool = False) -> bool | None:
@@ -319,6 +327,7 @@ class NightScore:
     rain_vetoed: bool
     rain_max_mm: float
     rain_max_prob: int | None
+    rain_unknown_hours: int       # window hours with no full rain forecast
     wind_max_kmh: int
     gust_max_kmh: int
     windy_vetoed: bool
@@ -545,12 +554,17 @@ def score_night(
     if not dark_hours:
         return None
 
-    # Precipitation veto across the whole equipment-exposure window.
-    rain_vetoed = any(h.wet for h in exposure_hours)
+    # Precipitation veto across the whole equipment-exposure window. Hours the
+    # forecast doesn't reach, or that lack an amount or probability, are unknown
+    # and veto the night just like forecast rain.
+    win_start, win_end = exposure_window(night)
+    window_hours = int((win_end - win_start).total_seconds() // 3600)
+    rain_unknown_hours = (sum(h.rain_unknown for h in exposure_hours)
+                          + max(0, window_hours - len(exposure_hours)))
+    rain_vetoed = rain_unknown_hours > 0 or any(h.wet for h in exposure_hours)
     rain_max_mm = max((h.max_precip_mm for h in exposure_hours), default=0.0)
     probs = [h.max_precip_prob for h in exposure_hours if h.max_precip_prob is not None]
     rain_max_prob = max(probs) if probs else None
-    win_start, win_end = exposure_window(night)
 
     # Wind over the exposure window — gusts are the spoiler, so we veto on gusts.
     wind_max = round(max((h.max_wind_kmh for h in exposure_hours), default=0.0))
@@ -604,6 +618,7 @@ def score_night(
         rain_vetoed=rain_vetoed,
         rain_max_mm=rain_max_mm,
         rain_max_prob=rain_max_prob,
+        rain_unknown_hours=rain_unknown_hours,
         wind_max_kmh=wind_max,
         gust_max_kmh=gust_max,
         windy_vetoed=windy_vetoed,
@@ -653,6 +668,7 @@ def snapshot(s: NightScore, at: datetime) -> dict:
         "low": low[0] if low else None,
         "mid": mid[0] if mid else None,
         "rain_mm": round(s.rain_max_mm, 1),
+        "rain_pct": s.rain_max_prob,
         "gust": s.gust_max_kmh,
     }
 
@@ -690,6 +706,10 @@ def describe_change(history: list[dict], cur: dict, now: datetime) -> str | None
     old_mm, new_mm = prev.get("rain_mm"), cur["rain_mm"]
     if old_mm is not None and (old_mm > PRECIP_AMOUNT_MAX) != (new_mm > PRECIP_AMOUNT_MAX):
         moved.append(f"rain {old_mm:.1f}→{new_mm:.1f}mm")
+    old_pct, new_pct = prev.get("rain_pct"), cur["rain_pct"]
+    if (old_pct is not None and new_pct is not None
+            and (old_pct > PRECIP_PROB_MAX) != (new_pct > PRECIP_PROB_MAX)):
+        moved.append(f"rain chance {old_pct}→{new_pct}%")
 
     trend = "".join(h["light"] for h in history[-3:]) + "→" + cur["light"]
     when = _when(prev["at"], now)
@@ -769,15 +789,10 @@ def format_night(s: NightScore, change: str | None = None, strip: bool = False) 
         cloud += " — some high cloud (ok for narrowband)"
     lines.append(cloud)
 
-    prob = f"{s.rain_max_prob}%" if s.rain_max_prob is not None else "n/a"
     if s.rain_vetoed:
-        lines.append(
-            f"🌧 rain {s.exposure_window}: chance up to {prob}, max {s.rain_max_mm:.1f}mm"
-        )
+        lines.append(f"🌧 rain {s.exposure_window}: {_rain_detail(s)}")
     else:
-        lines.append(
-            f"rain {s.exposure_window}: dry (max chance {prob}, max {s.rain_max_mm:.1f}mm)"
-        )
+        lines.append(f"rain {s.exposure_window}: dry (0% chance, 0.0mm)")
 
     wind_line = f"wind: {s.wind_max_kmh} km/h, gusts {s.gust_max_kmh} km/h"
     if s.windy_vetoed:
@@ -803,6 +818,16 @@ def format_night(s: NightScore, change: str | None = None, strip: bool = False) 
 LIGHT_RANK = {"🔴": 0, "🟡": 1, "🟢": 2}
 
 
+def _rain_detail(s: NightScore) -> str:
+    """Why the rain veto fired: the forecast chance/amount, plus any hours the
+    forecast doesn't fully cover (treated as wet)."""
+    prob = f"{s.rain_max_prob}%" if s.rain_max_prob is not None else "n/a"
+    detail = f"chance up to {prob}, max {s.rain_max_mm:.1f}mm"
+    if s.rain_unknown_hours:
+        detail += f", no rain forecast for {s.rain_unknown_hours}h (treated as wet)"
+    return detail
+
+
 def _reason(s: NightScore) -> str:
     """One-line human verdict for the daily digest."""
     if s.qualifies:
@@ -813,8 +838,7 @@ def _reason(s: NightScore) -> str:
             return f"🟢 {summary}"
         return f"🟡 maybe ({s.speculative_reason}) · {summary}"
     if s.rain_vetoed:
-        prob = f"{s.rain_max_prob}%" if s.rain_max_prob is not None else "n/a"
-        return f"🌧 rain in the window ({prob}, {s.rain_max_mm:.1f}mm)"
+        return f"🌧 rain in the window ({_rain_detail(s)})"
     if s.windy_vetoed:
         return f"💨 too windy (gusts {s.gust_max_kmh} km/h)"
     if REQUIRE_SETUP_WINDOW and not s.setup_ok:
@@ -1011,7 +1035,8 @@ def log_scores(scores: list[NightScore]) -> None:
             f"clear {s.setup_usable_any}h, "
             f"low cloud avg {low[0] if low else '?'}%, "
             f"rain max {s.rain_max_mm:.1f}mm/"
-            f"{s.rain_max_prob if s.rain_max_prob is not None else '-'}%, "
+            f"{s.rain_max_prob if s.rain_max_prob is not None else '-'}%"
+            f"{f' ({s.rain_unknown_hours}h unknown)' if s.rain_unknown_hours else ''}, "
             f"wind {s.wind_max_kmh}/gust {s.gust_max_kmh}km/h, "
             f"moon {s.moon_illum}%"
         )
