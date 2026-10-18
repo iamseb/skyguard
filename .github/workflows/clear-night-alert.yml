@@ -2,18 +2,21 @@ name: SkyGuard — Clear Night Alert
 
 on:
   schedule:
-    # Morning outlook (tonight + tomorrow). 06:00 UTC = 08:00 CEST / 07:00 CET.
-    - cron: "0 6 * * *"
-    # Evening update for tonight at 18:00 local (EVENING_HOUR in main.py). Cron
-    # is UTC and doesn't follow daylight saving, so fire both candidate slots —
-    # 16:00 UTC = 18:00 CEST, 17:00 UTC = 18:00 CET — and the script only runs
-    # the one that lands on 18:00 local, skipping its twin.
+    # Cron is UTC and doesn't follow daylight saving, so each run fires both
+    # candidate slots and the script only runs the one that lands on the local
+    # hour (OUTLOOK_HOUR / EVENING_HOUR in main.py), skipping its twin.
+    # Midday outlook (tonight + tomorrow) at 12:00 local —
+    # 10:00 UTC = 12:00 CEST, 11:00 UTC = 12:00 CET.
+    - cron: "0 10 * * *"
+    - cron: "0 11 * * *"
+    # Evening update for tonight at 18:00 local —
+    # 16:00 UTC = 18:00 CEST, 17:00 UTC = 18:00 CET.
     - cron: "0 16 * * *"
     - cron: "0 17 * * *"
   workflow_dispatch:
     inputs:
       mode:
-        description: "outlook = tonight + tomorrow (morning) · tonight = evening update"
+        description: "outlook = tonight + tomorrow (midday) · tonight = evening update"
         type: choice
         options: [outlook, tonight]
         default: outlook
@@ -58,8 +61,8 @@ jobs:
           # every day (not just on clear nights). Not sensitive, so a Variable
           # rather than a Secret. Unset = silent unless a night qualifies.
           DAILY_DIGEST: ${{ vars.DAILY_DIGEST }}
-          # The morning cron is the outlook; the evening crons are "tonight".
-          RUN_MODE: ${{ inputs.mode || (github.event.schedule == '0 6 * * *' && 'outlook' || 'tonight') }}
+          # The midday crons are the outlook; the evening crons are "tonight".
+          RUN_MODE: ${{ inputs.mode || ((github.event.schedule == '0 10 * * *' || github.event.schedule == '0 11 * * *') && 'outlook' || 'tonight') }}
           SCHEDULE: ${{ github.event.schedule }}
           DRY_RUN: ${{ inputs.dry_run && '1' || '' }}
       - name: Save forecast history

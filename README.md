@@ -1,7 +1,7 @@
 # SkyGuard — Clear Night Alert
 
 A passive push that tells you when an upcoming night is worth setting up for —
-a morning **outlook** for tonight and tomorrow, then an **evening update** at 18:00
+a midday **outlook** for tonight and tomorrow, then an **evening update** at 18:00
 that re-checks just tonight with the freshest model runs. No dashboard to check — silent unless a night clears the threshold, or
 turn on `DAILY_DIGEST` for a short status **every** day (so you also know it's
 running, and why nothing's on when it isn't).
@@ -58,7 +58,7 @@ a night looks usable.
   only ~2½ days ahead. Beyond that a verdict would rest on the global model alone
   and can swing a lot from one run to the next, so with `REQUIRE_BOTH_MODELS` on
   (default) a later night is scored only once both models cover its whole dark
-  and equipment-exposure windows. In practice: tonight + tomorrow in the morning,
+  and equipment-exposure windows. In practice: tonight + tomorrow at midday,
   tonight in the evening. Tonight is always scored, so if one model is down you
   get a tentative verdict rather than silence. `NIGHTS_AHEAD` is the upper limit.
 - **Confidence tiers**: a night that passes every rule is **🟢 confident** only
@@ -84,18 +84,18 @@ a night looks usable.
   💨 too windy / 🌆 not dark enough to align before bed / ☁ too cloudy). Handy as a
   daily heartbeat that confirms the job is running.
 - **Evening update (tonight)**: forecasts sharpen as the night gets closer — the
-  high-resolution model re-runs hourly, so by 18:00 it is ~10 hours fresher than
-  the morning outlook. The evening run re-scores **tonight only** and gives a
+  high-resolution model re-runs hourly, so by 18:00 it is ~6 hours fresher than
+  the midday outlook. The evening run re-scores **tonight only** and gives a
   go / no-go: "🟢 Tonight's on — set up from 21:00", "🔴 Tonight's off — rain
   forecast (was 🟢)", with an hour-by-hour strip for the whole dark window
-  (`21✓ 22◐ 23~ 00✗ …`). It follows the same rules as the morning run: it pushes
+  (`21✓ 22◐ 23~ 00✗ …`). It follows the same rules as the midday run: it pushes
   when tonight is 🟢 or 🟡, when tonight's light has dropped since the last run,
   or every time if `DAILY_DIGEST` is on.
 - **Forecast history (what changed)**: every run records a compact verdict per
   night (light, usable hours, low/mid cloud, rain, gusts), and the next run
   compares against it. Each night in the push then carries a line such as
   `↻ 🔴🟡→🟢 since yesterday evening · usable 1→6h · low 60→15%`, or
-  `↻ 🟢🟢→🟢 unchanged since this morning` — a forecast that holds steady across
+  `↻ 🟢🟢→🟢 unchanged since midday` — a forecast that holds steady across
   several runs is one you can trust more. Small wobbles are ignored
   (`CHANGE_HOURS`, `CHANGE_CLOUD_PTS`, `CHANGE_GUST_KMH`). A night whose light has
   dropped (🟢→🟡, 🟡→🔴, …) **always** triggers a push, even with the digest off, so
@@ -144,8 +144,9 @@ above this reject the night; set very high to disable the veto).
 unless a night qualifies (or a 🟢 night drops).
 
 **Run mode** — `RUN_MODE` (environment): `outlook` (default; the next
-nights both models cover, up to `NIGHTS_AHEAD`) or `tonight` (the evening update). `EVENING_HOUR` (in
-`CONFIG`, default 18) is the local hour the evening run is meant for.
+nights both models cover, up to `NIGHTS_AHEAD`) or `tonight` (the evening update).
+`OUTLOOK_HOUR` and `EVENING_HOUR` (in `CONFIG`, defaults 12 and 18) are the local
+hours the two runs are meant for.
 
 **History** — `STATE_FILE` (environment; default `.skyguard/state.json`) is where
 the per-night verdicts are kept between runs. Pruned automatically to the last
@@ -166,11 +167,12 @@ the per-night verdicts are kept between runs. Pruned automatically to the last
      nights), so you always know the job ran. Leave unset to stay silent unless a
      night qualifies. It's a Variable, not a Secret, because it isn't sensitive.
 4. The workflow in `.github/workflows/clear-night-alert.yml` runs the **outlook**
-   daily at 06:00 UTC and the **evening update** at 18:00 local. Cron is always UTC
-   and ignores daylight saving, so the evening has *two* cron lines (16:00 and
-   17:00 UTC — 18:00 in Central European summer and winter time); the script runs
-   whichever one lands on `EVENING_HOUR` local that day and skips the other. For
-   another timezone, set those two lines to the UTC hours that are 18:00 local in
+   at 12:00 local and the **evening update** at 18:00 local. Cron is always UTC
+   and ignores daylight saving, so each run has *two* cron lines (10:00/11:00 UTC
+   for the outlook, 16:00/17:00 UTC for the evening — the local hour in Central
+   European summer and winter time); the script runs whichever one lands on
+   `OUTLOOK_HOUR` / `EVENING_HOUR` local that day and skips the other. For another
+   timezone or hour, set each pair to the UTC hours that are that local hour in
    summer and in winter.
 5. **History** is carried between runs in the GitHub Actions cache (restored at the
    start of each run, saved at the end) — nothing is committed to the repo. If the

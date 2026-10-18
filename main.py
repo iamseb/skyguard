@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """SkyGuard — clear-night forecast alert.
 
-Runs each morning (the "outlook": tonight and any later night both forecast
-models already cover) and again each evening
+Runs each day at midday (the "outlook": tonight and any later night both
+forecast models already cover) and again each evening
 (the "tonight" update: a fresher look at just tonight). Pulls cloud forecast for
 a configured location from Open-Meteo (one primary model, one cross-check),
 evaluates only the hours of real darkness (nautical night), and sends a single
@@ -74,19 +74,21 @@ NIGHTS_AHEAD = 3
 # Only score a night once BOTH models cover it — its whole dark window and the
 # equipment-exposure window. The high-resolution primary model only reaches ~2½
 # days ahead, so beyond that a verdict would rest on the global model alone and
-# can swing a lot between runs. In practice the morning outlook then covers
+# can swing a lot between runs. In practice the midday outlook then covers
 # tonight and tomorrow, and the evening update tonight. Tonight is always scored,
 # so an outage of one model shows up as a tentative verdict rather than silence.
 REQUIRE_BOTH_MODELS = True
 
-# Run mode. "outlook" (default, the morning run) scores the upcoming nights
+# Run mode. "outlook" (default, the midday run) scores the upcoming nights
 # (see NIGHTS_AHEAD / REQUIRE_BOTH_MODELS). "tonight" (the evening run) re-scores just tonight with the freshest
 # model runs and always shows the hour-by-hour picture.
 RUN_MODE = _env("RUN_MODE", "outlook").lower()
 
-# Local hour the evening "tonight" update is meant for. The scheduler (cron) is
-# in UTC, so the workflow fires two UTC slots to cover daylight saving and the
-# run whose scheduled time lands on this local hour goes ahead; the other skips.
+# Local hours the two runs are meant for: the "outlook" at OUTLOOK_HOUR and the
+# evening "tonight" update at EVENING_HOUR. The scheduler (cron) is in UTC, so
+# the workflow fires two UTC slots per run to cover daylight saving and the one
+# whose scheduled time lands on the local hour goes ahead; the other skips.
+OUTLOOK_HOUR = 12
 EVENING_HOUR = 18
 
 # Forecast history. Every run records a compact verdict per night here, and the
@@ -674,12 +676,14 @@ def snapshot(s: NightScore, at: datetime) -> dict:
 
 
 def _when(stamp: str, now: datetime) -> str:
-    """'this morning' / 'yesterday evening' / 'Tue 18:00' for a history stamp."""
+    """'this morning' / 'midday' / 'yesterday evening' / 'Tue 18:00' for a
+    history stamp."""
     t = datetime.fromisoformat(stamp).astimezone(TZ)
-    part = "morning" if t.hour < 12 else "afternoon" if t.hour < 17 else "evening"
+    part = ("morning" if t.hour < 11 else "midday" if t.hour < 14
+            else "afternoon" if t.hour < 17 else "evening")
     days = (now.date() - t.date()).days
     if days == 0:
-        return f"this {part}"
+        return part if part == "midday" else f"this {part}"
     if days == 1:
         return f"yesterday {part}"
     return f"{t:%a %H:%M}"
@@ -865,7 +869,7 @@ def _nights_title(nights: list[NightScore], one: str, many: str) -> str:
 
 
 def build_message(scores: list[NightScore], changes: dict[date, str | None]) -> tuple[str, str]:
-    """Morning alert: 🟢/🟡 nights in full, the rest as short lines."""
+    """Outlook alert: 🟢/🟡 nights in full, the rest as short lines."""
     go = [s for s in scores if s.qualifies]
     sure = [s for s in go if s.confident]
     if sure:
@@ -962,10 +966,10 @@ def send_pushover(title: str, message: str) -> None:
 # Main                                                                         #
 # --------------------------------------------------------------------------- #
 
-def evening_slot_due() -> bool:
-    """For the evening run: True when the cron slot that fired lands on
-    EVENING_HOUR local today. The workflow fires two UTC slots so that one of
-    them is EVENING_HOUR local in both summer and winter time; this picks it.
+def slot_due(local_hour: int) -> bool:
+    """True when the cron slot that fired lands on `local_hour` local today.
+    The workflow fires two UTC slots per run so that one of them is that local
+    hour in both summer and winter time; this picks it.
     Uses the SCHEDULED slot (not the clock), so a late-starting run still
     counts. Manual and local runs (no SCHEDULE) always go ahead."""
     fields = os.environ.get("SCHEDULE", "").split()
@@ -974,7 +978,7 @@ def evening_slot_due() -> bool:
     slot = datetime.now(timezone.utc).replace(
         hour=int(fields[1]), minute=int(fields[0]), second=0, microsecond=0
     )
-    return slot.astimezone(TZ).hour == EVENING_HOUR
+    return slot.astimezone(TZ).hour == local_hour
 
 
 def _both_models_cover(hours: list[HourCloud]) -> bool:
@@ -1046,8 +1050,9 @@ def main() -> int:
     if RUN_MODE not in ("outlook", "tonight"):
         print(f"Unknown RUN_MODE {RUN_MODE!r} — use 'outlook' or 'tonight'.")
         return 1
-    if RUN_MODE == "tonight" and not evening_slot_due():
-        print(f"This slot isn't {EVENING_HOUR}:00 local today (daylight-saving twin) — skipping.")
+    run_hour = EVENING_HOUR if RUN_MODE == "tonight" else OUTLOOK_HOUR
+    if not slot_due(run_hour):
+        print(f"This slot isn't {run_hour}:00 local today (daylight-saving twin) — skipping.")
         return 0
 
     hours = fetch_forecast()
