@@ -130,14 +130,15 @@ usable).
 can see *when* the cloud comes and goes rather than reconcile whole-night
 averages. It opens with the verdict in plain words ("Clear 19:00–23:00", or
 "Misty …" / "Hazy …" when that's what holds it back), then an icon per dark hour
-(moon and stars = clear, moon over haze = heavy cirrus or mist, moon behind a
-cloud = the models disagree, cloud = not usable) above a bar in the verdict's
+(moon = clear, moon over haze = heavy cirrus or mist, moon behind a cloud = the
+models disagree, cloud = cloudy, cloud over fog lines = fog) above a bar in the verdict's
 colour, then one card per layer — low, mid, high — with both models drawn as
 curves against that layer's limit, and a visibility card with the mist line. Twilight is shaded, and the
 set-up-to-bed window is lightly banded. The outlook charts the night its title
 is about. The chart needs matplotlib and uses the bundled Inter font
-(`fonts/`, SIL Open Font License); if it can't be drawn, the push goes out as
-text only.
+(`fonts/`, SIL Open Font License) and [Meteocons](https://github.com/basmilius/weather-icons)
+icons by Bas Milius (`icons/`, line style rasterised to PNG, MIT licence); if it
+can't be drawn, the push goes out as text only.
 
 ## Configure
 

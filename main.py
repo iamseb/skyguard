@@ -34,6 +34,7 @@ to print the message to stdout instead of pushing.
 
 from __future__ import annotations
 
+import functools
 import json
 import logging
 import math
@@ -1197,7 +1198,9 @@ def build_tonight(s: NightScore, change: str | None, prev_light: str | None) -> 
 # Chart styling, after a phone weather app at night: a deep sky gradient,
 # translucent rounded cards, smooth curves with soft fills, and a plain-words
 # headline. Model colours were checked for colour-blind separation against the
-# card surface; each verdict circle carries its mark as well as its colour.
+# card surface; each hour's verdict has an icon as well as a colour. Icons are
+# Meteocons by Bas Milius (line style, MIT licence; see icons/LICENSE), trimmed
+# to their artwork and rasterised to PNG so drawing needs no SVG renderer.
 CHART_DPI = 150
 CHART_WIDTH = 7.2                       # inches → 1080 px
 CHART_SKY = ("#0b1330", "#27345f")      # gradient, top → bottom
@@ -1212,12 +1215,12 @@ CHART_SETUP_BAND = (1, 1, 1, 0.05)
 CHART_MODELS = ((PRIMARY_MODEL, "primary", "#2a93dc"),
                 (SECONDARY_MODEL, "secondary", "#e25c84"))
 MARK_COLOURS = {"✓": "#30d158", "◐": "#ffd60a", "~": "#ff9f0a", "✗": "#ff453a"}
-MARK_WORDS = (("✓", "clear"), ("◐", "hazy"), ("~", "models differ"), ("✗", "cloudy"))
-CHART_MOON = "#fff1c4"
-CHART_WISP = "#c3cce3"
-CHART_CLOUD = "#e9edf6"
-CHART_CLOUD_GREY = "#a6afc4"
-CHART_CLOUD_DARK = "#737d96"
+MARK_WORDS = (("✓", "clear"), ("◐", "hazy"), ("~", "models differ"), ("✗", "cloudy"),
+              ("fog", "fog"))
+ICONS = {"✓": "clear-night", "◐": "haze-night", "~": "partly-cloudy-night",
+         "✗": "overcast", "fog": "fog",                              # hourly verdicts
+         "moon": "clear-night", "cloud": "cloudy", "mist": "mist"}  # card labels
+ICON_DIR = Path(__file__).resolve().parent / "icons"
 VIS_SCALE_KM = 30  # visibility card: 0 to this, clearer air pinned at the top
 MODEL_NAMES = {
     "knmi_harmonie_arome_netherlands": "KNMI HARMONIE",
@@ -1313,106 +1316,35 @@ def _monotone(xs: list[float], ys: list[float], per: int = 16) -> tuple[list[flo
     return out_x + [xs[-1]], out_y + [ys[-1]]
 
 
-def _arc(cx, cy, r, start, end, through, n=48) -> list[tuple[float, float]]:
-    """Points on a circle from angle `start` to `end`, going whichever way
-    passes `through`."""
-    tau = 2 * math.pi
-    ccw = (end - start) % tau
-    sweep = ccw if (through - start) % tau < ccw else ccw - tau
-    return [(cx + r * math.cos(start + sweep * k / n), cy + r * math.sin(start + sweep * k / n))
-            for k in range(n + 1)]
+@functools.cache
+def _icon_image(name: str):
+    import matplotlib.image as mpimg
+    return mpimg.imread(ICON_DIR / f"{name}.png")
 
 
-def _crescent(cx, cy, r, bite=math.pi / 4) -> list[tuple[float, float]]:
-    """Outline of a crescent moon: a disc of radius r with a bite taken out
-    towards angle `bite`."""
-    d, rb = 0.52 * r, 0.82 * r
-    bx, by = cx + d * math.cos(bite), cy + d * math.sin(bite)
-    a = (r * r - rb * rb + d * d) / (2 * d)
-    h = math.sqrt(r * r - a * a)
-    ux, uy = math.cos(bite), math.sin(bite)
-    p1 = (cx + a * ux - h * uy, cy + a * uy + h * ux)
-    p2 = (cx + a * ux + h * uy, cy + a * uy - h * ux)
-    away = bite + math.pi
-    outer = _arc(cx, cy, r, math.atan2(p1[1] - cy, p1[0] - cx),
-                 math.atan2(p2[1] - cy, p2[0] - cx), away)
-    inner = _arc(bx, by, rb, math.atan2(p2[1] - by, p2[0] - bx),
-                 math.atan2(p1[1] - by, p1[0] - bx), away)
-    return outer + inner
+def _icon_size(mark: str, size: float) -> tuple[float, float]:
+    """(width, height) in inches of `mark`'s icon at `size`. Icons are trimmed
+    to their artwork and scaled to the same area (size²), so a wide cloud and
+    a round moon carry the same visual weight."""
+    h_px, w_px = _icon_image(ICONS[mark]).shape[:2]
+    k = size / math.sqrt(w_px * h_px)
+    return w_px * k, h_px * k
 
 
-def _sparkle(cx, cy, s) -> list[tuple[float, float]]:
-    """A four-pointed star."""
-    w = s * 0.28
-    return [(cx, cy + s), (cx + w, cy + w), (cx + s, cy), (cx + w, cy - w),
-            (cx, cy - s), (cx - w, cy - w), (cx - s, cy), (cx - w, cy + w)]
-
-
-def _mix(a, b, f: float) -> tuple[float, float, float]:
-    """Colour a blended a fraction f of the way to b."""
-    from matplotlib.colors import to_rgb
-    a, b = to_rgb(a), to_rgb(b)
-    return tuple(a[c] + (b[c] - a[c]) * f for c in range(3))
-
-
-def _draw_icon(fig, mark: str, x: float, y: float, size: float, cutout) -> None:
-    """A night-sky weather icon for an hour's verdict, centred on (x, y) inches:
-    ✓ moon and stars · ◐ moon behind wisps of cirrus or mist · ~ moon partly behind a
-    cloud (the models disagree) · ✗ overcast. `cutout` is the colour behind
-    the icon, used to separate overlapping shapes."""
-    from matplotlib.lines import Line2D
-    from matplotlib.patches import Circle, FancyBboxPatch, Polygon
-
-    inch, u = fig.dpi_scale_trans, size / 2
-    cut_pt = max(0.8, size * 72 * 0.045)
-
-    def add(artist):
-        artist.set_transform(inch)
-        fig.add_artist(artist)
-
-    def moon(cx, cy, r, colour=CHART_MOON, bite=math.pi / 4):
-        add(Polygon(_crescent(x + cx * u, y + cy * u, r * u, bite), closed=True,
-                    facecolor=colour, edgecolor=cutout, lw=cut_pt, joinstyle="round"))
-
-    def cloud(cx, cy, k, colour, halo=True):
-        def parts():
-            yield FancyBboxPatch((x + (cx - 0.85 * k) * u, y + (cy - 0.5 * k) * u),
-                                 1.7 * k * u, 0.45 * k * u,
-                                 boxstyle=f"round,pad=0,rounding_size={0.22 * k * u}")
-            for ox, oy, r in ((-0.4, -0.08, 0.38), (0.12, 0.12, 0.5), (0.55, -0.12, 0.32)):
-                yield Circle((x + (cx + ox * k) * u, y + (cy + oy * k) * u), r * k * u)
-        for p in parts() if halo else ():  # a cut-out halo, so the cloud stands
-            p.set(facecolor=cutout, edgecolor=cutout, lw=cut_pt * 2)  # off what's behind
-            add(p)
-        for p in parts():
-            p.set(facecolor=colour, lw=0)
-            add(p)
-
-    if mark == "✓":
-        moon(-0.12, -0.08, 0.72)
-        for sx, sy, ss in ((0.6, 0.55, 0.22), (0.78, 0.05, 0.12)):
-            add(Polygon(_sparkle(x + sx * u, y + sy * u, ss * u), closed=True,
-                        facecolor=CHART_INK, lw=0))
-    elif mark == "◐":
-        moon(0.0, 0.3, 0.62)
-        for x0, x1, wy in ((-0.78, 0.45, -0.5), (-0.45, 0.78, -0.76)):
-            for colour, lw in ((cutout, cut_pt * 2 + 1.4), (CHART_WISP, 1.4)):
-                add(Line2D([x + x0 * u, x + x1 * u], [y + wy * u] * 2, color=colour,
-                           lw=lw, solid_capstyle="round"))
-    elif mark == "~":
-        moon(0.34, 0.4, 0.58, bite=math.pi * 0.85)  # bite towards the cloud
-        cloud(-0.12, -0.24, 0.84, CHART_CLOUD)
-    elif mark == "moon":  # card-label icons, in the label's muted ink
-        moon(0, 0, 0.8, colour=_mix(cutout, CHART_INK, 0.5))
-    elif mark == "cloud":
-        cloud(0, 0.1, 1.0, _mix(cutout, CHART_INK, 0.5), halo=False)
-    elif mark == "mist":  # three drifting lines
-        for x0, x1, wy in ((-0.85, 0.55, 0.5), (-0.55, 0.85, 0.0), (-0.85, 0.4, -0.5)):
-            add(Line2D([x + x0 * u, x + x1 * u], [y + wy * u] * 2,
-                       color=_mix(cutout, CHART_INK, 0.5), lw=1.1, solid_capstyle="round"))
-    else:
-        cloud(0.28, 0.3, 0.62, CHART_CLOUD_DARK)
-        cloud(-0.1, -0.12, 0.92, CHART_CLOUD_GREY)
+def _draw_icon(fig, mark: str, x: float, y: float, size: float, muted: bool = False) -> None:
+    """The icon for an hour's verdict (✓ ◐ ~ ✗, or "fog") or a card label
+    ("moon", "cloud", "mist"), centred on (x, y) inches. `muted` tints it to
+    the faint label ink."""
+    img = _icon_image(ICONS[mark])
+    if muted:
+        img = img.copy()
+        img[..., :3] = 1.0
+        img[..., 3] *= CHART_FAINT[3]
+    w, h = _icon_size(mark, size)
+    W, H = fig.get_size_inches()
+    ax = fig.add_axes(((x - w / 2) / W, (y - h / 2) / H, w / W, h / H))
+    ax.imshow(img, interpolation="lanczos")
+    ax.set_axis_off()
 
 
 def _draw_chart(plt, s: NightScore, hours: list[HourCloud]) -> bytes | None:
@@ -1465,13 +1397,6 @@ def _draw_chart(plt, s: NightScore, hours: list[HourCloud]) -> bytes | None:
                 for i in range(256)], aspect="auto", extent=(0, 1, 0, 1))
     sky.set_axis_off()
 
-    def sky_card_at(y_in: float) -> tuple[float, float, float]:
-        """The solid colour a card shows at height y (inches): sky + card tint."""
-        f = 1 - y_in / H
-        alpha = CHART_CARD[3]
-        return tuple((top[c] + (bottom[c] - top[c]) * f) * (1 - alpha) + alpha
-                     for c in range(3))
-
     def text(x, y, s_, **kw):
         kw.setdefault("color", CHART_INK)
         return fig.text(x, y, s_, transform=inch, **kw)
@@ -1484,11 +1409,13 @@ def _draw_chart(plt, s: NightScore, hours: list[HourCloud]) -> bytes | None:
         return x, y, w, height
 
     def card_label(x, y_top, w, left, right=None, icon=None):
+        tx = x + P
         if icon:
-            _draw_icon(fig, icon, x + P + 0.07, y_top - P - 0.057, 0.15,
-                       sky_card_at(y_top - P))
-        text(x + P + (0.21 if icon else 0), y_top - P, left, fontsize=8,
-             fontweight="medium", color=CHART_FAINT, va="top")
+            w, _ = _icon_size(icon, 0.15)
+            _draw_icon(fig, icon, tx + w / 2, y_top - P - 0.057, 0.15, muted=True)
+            tx += w + 0.07
+        text(tx, y_top - P, left, fontsize=8, fontweight="medium", color=CHART_FAINT,
+             va="top")
         if right:
             text(x + w - P, y_top - P, right, fontsize=8, fontweight="medium",
                  color=CHART_FAINT, va="top", ha="right")
@@ -1507,22 +1434,27 @@ def _draw_chart(plt, s: NightScore, hours: list[HourCloud]) -> bytes | None:
     cx, cy, cw, ch = card(y, HOURLY)
     card_label(cx, y, cw, "HOURLY", icon="moon")
     renderer = fig.canvas.get_renderer()
+    # An unusable hour lost to fog rather than cloud gets the fog icon.
+    icons = ["fog" if _mark(h) == "✗" and h.fog else _mark(h) for h in s.dark_hours]
     lx = cx + cw - P
     for mark, word in reversed(MARK_WORDS):  # the key, right-aligned in the label row
+        if mark == "fog" and "fog" not in icons:
+            continue
         t = text(lx, y - P, word, fontsize=8, fontweight="medium", color=CHART_FAINT,
                  va="top", ha="right")
-        lx -= t.get_window_extent(renderer).width / CHART_DPI + 0.11
-        _draw_icon(fig, mark, lx, y - P - 0.057, 0.16, sky_card_at(y - P))
-        lx -= 0.22
+        lx -= t.get_window_extent(renderer).width / CHART_DPI + 0.06
+        w, _ = _icon_size(mark, 0.16)
+        _draw_icon(fig, mark, lx - w / 2, y - P - 0.057, 0.16)
+        lx -= w + 0.16
     n = len(s.dark_hours)
     col = (cw - 2 * P) / n
-    size = min(0.32, col * 0.62)
-    for i, h in enumerate(s.dark_hours):
+    size = min(0.34, col * 0.62)
+    for i, (h, icon) in enumerate(zip(s.dark_hours, icons)):
         x = cx + P + col * (i + 0.5)
         mark = _mark(h)
         text(x, cy + ch - 0.47, f"{h.time:%H}", fontsize=9.5, fontweight="medium",
              ha="center", va="center")
-        _draw_icon(fig, mark, x, cy + ch - 0.76, size, sky_card_at(cy + ch - 0.76))
+        _draw_icon(fig, icon, x, cy + ch - 0.76, size)
         fig.add_artist(Line2D([x - col * 0.38, x + col * 0.38], [cy + ch - 1.01] * 2,
                               transform=inch, color=MARK_COLOURS[mark], lw=2,
                               solid_capstyle="round"))
