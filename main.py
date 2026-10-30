@@ -6,7 +6,8 @@ forecast models already cover) and again each evening
 (the "tonight" update: a fresher look at just tonight). Pulls cloud forecast for
 a configured location from Open-Meteo (one primary model, one cross-check),
 evaluates only the hours of real darkness (nautical night), and sends a single
-Pushover push if a night looks usable. Silent otherwise.
+Pushover push if a night looks usable — with a chart of the night's cloud,
+hour by hour, attached. Silent otherwise.
 
 Each run's verdict per night is kept in a small history file, so the push can
 say how the forecast for a night has moved since the previous run (🔴→🟢, low
@@ -28,6 +29,7 @@ to print the message to stdout instead of pushing.
 from __future__ import annotations
 
 import json
+import logging
 import math
 import os
 import sys
@@ -195,6 +197,15 @@ CURFEW_HOUR = 23
 # Show a per-hour cloud breakdown in the push when the dark window is at most
 # this many hours; otherwise show a compact summary only.
 MAX_HOURLY_DETAIL = 6
+
+# Cloud chart. Each push carries a PNG of the charted night's forecast, hour by
+# hour: one panel per cloud layer with both models drawn against that layer's
+# limit, under a strip of the per-hour verdicts (✓ ◐ ~ ✗). It shows WHEN the
+# cloud comes and goes, which the whole-night averages in the text can't. Needs
+# matplotlib; if that's missing or drawing fails, the push goes out without it.
+# A dry run saves the chart to CHART_FILE instead.
+SEND_CHART = _env_bool("SEND_CHART", True)
+CHART_FILE = Path(_env("CHART_FILE", ".skyguard/chart.png"))
 
 # Forecast models. Primary first; high confidence requires both to agree. The
 # default primary (KNMI HARMONIE) is a high-resolution model for the Netherlands;
@@ -930,6 +941,396 @@ def build_tonight(s: NightScore, change: str | None, prev_light: str | None) -> 
     return title, format_night(s, change, strip=True)
 
 
+# Chart styling, after a phone weather app at night: a deep sky gradient,
+# translucent rounded cards, smooth curves with soft fills, and a plain-words
+# headline. Model colours were checked for colour-blind separation against the
+# card surface; each verdict circle carries its mark as well as its colour.
+CHART_DPI = 150
+CHART_WIDTH = 7.2                       # inches → 1080 px
+CHART_SKY = ("#0b1330", "#27345f")      # gradient, top → bottom
+CHART_CARD = (1, 1, 1, 0.075)
+CHART_CARD_EDGE = (1, 1, 1, 0.09)
+CHART_INK = "#ffffff"
+CHART_SOFT = (1, 1, 1, 0.72)
+CHART_FAINT = (1, 1, 1, 0.5)
+CHART_GRID = (1, 1, 1, 0.12)
+CHART_TWILIGHT = (0, 0, 0, 0.22)
+CHART_SETUP_BAND = (1, 1, 1, 0.05)
+CHART_MODELS = ((PRIMARY_MODEL, "primary", "#2a93dc"),
+                (SECONDARY_MODEL, "secondary", "#e25c84"))
+MARK_COLOURS = {"✓": "#30d158", "◐": "#ffd60a", "~": "#ff9f0a", "✗": "#ff453a"}
+MARK_WORDS = (("✓", "clear"), ("◐", "cirrus"), ("~", "models differ"), ("✗", "cloudy"))
+CHART_MOON = "#fff1c4"
+CHART_WISP = "#c3cce3"
+CHART_CLOUD = "#e9edf6"
+CHART_CLOUD_GREY = "#a6afc4"
+CHART_CLOUD_DARK = "#737d96"
+MODEL_NAMES = {
+    "knmi_harmonie_arome_netherlands": "KNMI HARMONIE",
+    "ecmwf_ifs025": "ECMWF IFS",
+}
+FONT_DIR = Path(__file__).resolve().parent / "fonts"
+
+
+def render_chart(s: NightScore, hours: list[HourCloud]) -> bytes | None:
+    """PNG of the night's cloud forecast hour by hour, or None if it can't be
+    drawn (the push then goes out as text only)."""
+    try:
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+        from matplotlib import font_manager
+    except ImportError:
+        print("[chart] matplotlib not installed — sending without a chart.")
+        return None
+    try:
+        # The symbol fallback has no Medium weight; that's expected, not news.
+        logging.getLogger("matplotlib.font_manager").setLevel(logging.ERROR)
+        for ttf in FONT_DIR.glob("*.ttf"):
+            font_manager.fontManager.addfont(str(ttf))
+        # Inter for text; DejaVu Sans covers any symbol Inter lacks.
+        plt.rcParams.update({"font.family": ["Inter", "DejaVu Sans"]})
+        return _draw_chart(plt, s, hours)
+    except Exception as e:  # a broken chart must never cost the alert
+        print(f"[chart] failed ({e!r}) — sending without a chart.")
+        return None
+
+
+def _headline(s: NightScore) -> tuple[str, str]:
+    """('Clear 19:00–23:00', 'Confident go · set up from 21:00 · bed 01:00 · …')."""
+    if s.qualifies:
+        run_len, run_start = s.run
+        run_end = run_start + timedelta(hours=run_len)
+        if run_start <= s.dark_start and run_end >= s.dark_end:
+            head = "Clear all night"
+        elif run_end >= s.dark_end:
+            head = f"Clear from {run_start:%H:%M}"
+        else:
+            head = f"Clear {run_start:%H:%M}–{run_end:%H:%M}"
+    else:
+        head = _short_reason(s).capitalize()
+    verdict = {"🟢": "Confident go", "🟡": f"Maybe: {s.speculative_reason}",
+               "🔴": "Not tonight"}[s.light]
+    parts = [verdict]
+    if s.rain_vetoed:
+        prob = f", {s.rain_max_prob}% chance" if s.rain_max_prob is not None else ""
+        parts.append(f"rain up to {s.rain_max_mm:.1f} mm{prob}")
+    elif s.windy_vetoed:
+        parts.append(f"gusts {s.gust_max_kmh} km/h")
+    if REQUIRE_SETUP_WINDOW:
+        if s.qualifies and s.setup_align_from:
+            parts.append(f"set up from {s.setup_align_from:%H:%M}")
+        parts.append(f"bed {setup_window(s.night)[1]:%H:%M}")
+    parts.append(f"moon {s.moon_illum}%")
+    return head, " · ".join(parts)
+
+
+def _monotone(xs: list[float], ys: list[float], per: int = 16) -> tuple[list[float], list[float]]:
+    """Dense points on a monotone cubic (Fritsch–Carlson) through (xs, ys): a
+    smooth curve that never overshoots, so cloud stays within 0–100% and a flat
+    run stays flat."""
+    n = len(xs)
+    if n < 2:
+        return xs, ys
+    d = [(ys[i + 1] - ys[i]) / (xs[i + 1] - xs[i]) for i in range(n - 1)]
+    m = [d[0]] + [0.0 if d[i - 1] * d[i] <= 0 else (d[i - 1] + d[i]) / 2
+                  for i in range(1, n - 1)] + [d[-1]]
+    for i in range(n - 1):
+        if d[i] == 0:
+            m[i] = m[i + 1] = 0.0
+            continue
+        a, b = m[i] / d[i], m[i + 1] / d[i]
+        if a * a + b * b > 9:
+            t = 3 / math.sqrt(a * a + b * b)
+            m[i], m[i + 1] = t * a * d[i], t * b * d[i]
+    out_x, out_y = [], []
+    for i in range(n - 1):
+        h = xs[i + 1] - xs[i]
+        for k in range(per):
+            t = k / per
+            h00, h10 = 2 * t**3 - 3 * t**2 + 1, t**3 - 2 * t**2 + t
+            h01, h11 = -2 * t**3 + 3 * t**2, t**3 - t**2
+            out_x.append(xs[i] + t * h)
+            out_y.append(h00 * ys[i] + h10 * h * m[i] + h01 * ys[i + 1] + h11 * h * m[i + 1])
+    return out_x + [xs[-1]], out_y + [ys[-1]]
+
+
+def _arc(cx, cy, r, start, end, through, n=48) -> list[tuple[float, float]]:
+    """Points on a circle from angle `start` to `end`, going whichever way
+    passes `through`."""
+    tau = 2 * math.pi
+    ccw = (end - start) % tau
+    sweep = ccw if (through - start) % tau < ccw else ccw - tau
+    return [(cx + r * math.cos(start + sweep * k / n), cy + r * math.sin(start + sweep * k / n))
+            for k in range(n + 1)]
+
+
+def _crescent(cx, cy, r, bite=math.pi / 4) -> list[tuple[float, float]]:
+    """Outline of a crescent moon: a disc of radius r with a bite taken out
+    towards angle `bite`."""
+    d, rb = 0.52 * r, 0.82 * r
+    bx, by = cx + d * math.cos(bite), cy + d * math.sin(bite)
+    a = (r * r - rb * rb + d * d) / (2 * d)
+    h = math.sqrt(r * r - a * a)
+    ux, uy = math.cos(bite), math.sin(bite)
+    p1 = (cx + a * ux - h * uy, cy + a * uy + h * ux)
+    p2 = (cx + a * ux + h * uy, cy + a * uy - h * ux)
+    away = bite + math.pi
+    outer = _arc(cx, cy, r, math.atan2(p1[1] - cy, p1[0] - cx),
+                 math.atan2(p2[1] - cy, p2[0] - cx), away)
+    inner = _arc(bx, by, rb, math.atan2(p2[1] - by, p2[0] - bx),
+                 math.atan2(p1[1] - by, p1[0] - bx), away)
+    return outer + inner
+
+
+def _sparkle(cx, cy, s) -> list[tuple[float, float]]:
+    """A four-pointed star."""
+    w = s * 0.28
+    return [(cx, cy + s), (cx + w, cy + w), (cx + s, cy), (cx + w, cy - w),
+            (cx, cy - s), (cx - w, cy - w), (cx - s, cy), (cx - w, cy + w)]
+
+
+def _mix(a, b, f: float) -> tuple[float, float, float]:
+    """Colour a blended a fraction f of the way to b."""
+    from matplotlib.colors import to_rgb
+    a, b = to_rgb(a), to_rgb(b)
+    return tuple(a[c] + (b[c] - a[c]) * f for c in range(3))
+
+
+def _draw_icon(fig, mark: str, x: float, y: float, size: float, cutout) -> None:
+    """A night-sky weather icon for an hour's verdict, centred on (x, y) inches:
+    ✓ moon and stars · ◐ moon behind wisps of cirrus · ~ moon partly behind a
+    cloud (the models disagree) · ✗ overcast. `cutout` is the colour behind
+    the icon, used to separate overlapping shapes."""
+    from matplotlib.lines import Line2D
+    from matplotlib.patches import Circle, FancyBboxPatch, Polygon
+
+    inch, u = fig.dpi_scale_trans, size / 2
+    cut_pt = max(0.8, size * 72 * 0.045)
+
+    def add(artist):
+        artist.set_transform(inch)
+        fig.add_artist(artist)
+
+    def moon(cx, cy, r, colour=CHART_MOON, bite=math.pi / 4):
+        add(Polygon(_crescent(x + cx * u, y + cy * u, r * u, bite), closed=True,
+                    facecolor=colour, edgecolor=cutout, lw=cut_pt, joinstyle="round"))
+
+    def cloud(cx, cy, k, colour, halo=True):
+        def parts():
+            yield FancyBboxPatch((x + (cx - 0.85 * k) * u, y + (cy - 0.5 * k) * u),
+                                 1.7 * k * u, 0.45 * k * u,
+                                 boxstyle=f"round,pad=0,rounding_size={0.22 * k * u}")
+            for ox, oy, r in ((-0.4, -0.08, 0.38), (0.12, 0.12, 0.5), (0.55, -0.12, 0.32)):
+                yield Circle((x + (cx + ox * k) * u, y + (cy + oy * k) * u), r * k * u)
+        for p in parts() if halo else ():  # a cut-out halo, so the cloud stands
+            p.set(facecolor=cutout, edgecolor=cutout, lw=cut_pt * 2)  # off what's behind
+            add(p)
+        for p in parts():
+            p.set(facecolor=colour, lw=0)
+            add(p)
+
+    if mark == "✓":
+        moon(-0.12, -0.08, 0.72)
+        for sx, sy, ss in ((0.6, 0.55, 0.22), (0.78, 0.05, 0.12)):
+            add(Polygon(_sparkle(x + sx * u, y + sy * u, ss * u), closed=True,
+                        facecolor=CHART_INK, lw=0))
+    elif mark == "◐":
+        moon(0.0, 0.3, 0.62)
+        for x0, x1, wy in ((-0.78, 0.45, -0.5), (-0.45, 0.78, -0.76)):
+            for colour, lw in ((cutout, cut_pt * 2 + 1.4), (CHART_WISP, 1.4)):
+                add(Line2D([x + x0 * u, x + x1 * u], [y + wy * u] * 2, color=colour,
+                           lw=lw, solid_capstyle="round"))
+    elif mark == "~":
+        moon(0.34, 0.4, 0.58, bite=math.pi * 0.85)  # bite towards the cloud
+        cloud(-0.12, -0.24, 0.84, CHART_CLOUD)
+    elif mark == "moon":  # card-label icons, in the label's muted ink
+        moon(0, 0, 0.8, colour=_mix(cutout, CHART_INK, 0.5))
+    elif mark == "cloud":
+        cloud(0, 0.1, 1.0, _mix(cutout, CHART_INK, 0.5), halo=False)
+    else:
+        cloud(0.28, 0.3, 0.62, CHART_CLOUD_DARK)
+        cloud(-0.1, -0.12, 0.92, CHART_CLOUD_GREY)
+
+
+def _draw_chart(plt, s: NightScore, hours: list[HourCloud]) -> bytes | None:
+    import io
+
+    from matplotlib.colors import to_rgb
+    from matplotlib.lines import Line2D
+    from matplotlib.patches import FancyBboxPatch, Polygon
+
+    # Span the equipment-exposure window, widened if darkness starts earlier
+    # (deep winter) so every dark hour is on the chart.
+    win_start, win_end = exposure_window(s.night)
+    start, end = min(win_start, s.dark_start), max(win_end, s.dark_end)
+    span = [h for h in hours if start <= h.time <= end]
+    if len(span) < 2:
+        return None
+    x_of = lambda t: (t - start).total_seconds() / 3600  # noqa: E731
+    xs = [x_of(h.time) for h in span]
+    su_start, su_end = setup_window(s.night)
+
+    high_limit = HIGH_CLOUD_MAX if HIGH_CLOUD_MAX is not None else HIGH_CLOUD_CONFIDENT_MAX
+    cards = [("low", "LOW CLOUD", LOW_CLOUD_MAX, 1.75),
+             ("mid", "MID CLOUD", MID_CLOUD_MAX, 1.1),
+             ("high", "HIGH CLOUD · CIRRUS", high_limit, 1.3)]
+
+    # Layout in inches, top down.
+    W, M, P, GAP, R = CHART_WIDTH, 0.22, 0.16, 0.11, 0.16
+    HEADER, HOURLY, FOOTER = 0.98, 1.26, 0.36
+    H = M + HEADER + GAP + HOURLY + sum(c[3] + GAP for c in cards) + FOOTER
+    fig = plt.figure(figsize=(W, H), dpi=CHART_DPI)
+    inch = fig.dpi_scale_trans
+
+    sky = fig.add_axes((0, 0, 1, 1), zorder=-10)
+    top, bottom = to_rgb(CHART_SKY[0]), to_rgb(CHART_SKY[1])
+    sky.imshow([[[top[c] + (bottom[c] - top[c]) * i / 255 for c in range(3)]]
+                for i in range(256)], aspect="auto", extent=(0, 1, 0, 1))
+    sky.set_axis_off()
+
+    def sky_card_at(y_in: float) -> tuple[float, float, float]:
+        """The solid colour a card shows at height y (inches): sky + card tint."""
+        f = 1 - y_in / H
+        alpha = CHART_CARD[3]
+        return tuple((top[c] + (bottom[c] - top[c]) * f) * (1 - alpha) + alpha
+                     for c in range(3))
+
+    def text(x, y, s_, **kw):
+        kw.setdefault("color", CHART_INK)
+        return fig.text(x, y, s_, transform=inch, **kw)
+
+    def card(y_top: float, height: float) -> tuple[float, float, float, float]:
+        x, w, y = M, W - 2 * M, y_top - height
+        fig.add_artist(FancyBboxPatch((x, y), w, height, transform=inch,
+                                      boxstyle=f"round,pad=0,rounding_size={R}",
+                                      facecolor=CHART_CARD, edgecolor=CHART_CARD_EDGE, lw=0.5))
+        return x, y, w, height
+
+    def card_label(x, y_top, w, left, right=None, icon=None):
+        if icon:
+            _draw_icon(fig, icon, x + P + 0.07, y_top - P - 0.057, 0.15,
+                       sky_card_at(y_top - P))
+        text(x + P + (0.21 if icon else 0), y_top - P, left, fontsize=8,
+             fontweight="medium", color=CHART_FAINT, va="top")
+        if right:
+            text(x + w - P, y_top - P, right, fontsize=8, fontweight="medium",
+                 color=CHART_FAINT, va="top", ha="right")
+
+    # Header: the night, the verdict in plain words, and the plan.
+    y = H - M
+    head, sub = _headline(s)
+    text(M + 0.03, y - 0.02, f"{s.night:%A %-d %B}".upper(), fontsize=9,
+         fontweight="medium", color=CHART_SOFT, va="top")
+    text(M + 0.02, y - 0.22, head, fontsize=22, fontweight="medium", va="top")
+    text(M + 0.03, y - 0.72, sub, fontsize=10, color=CHART_SOFT, va="top")
+    y -= HEADER + GAP
+
+    # Hourly verdicts across the dark window: an icon per hour, and under the
+    # icons a bar coloured by verdict for the go / no-go at a glance.
+    cx, cy, cw, ch = card(y, HOURLY)
+    card_label(cx, y, cw, "HOURLY", icon="moon")
+    renderer = fig.canvas.get_renderer()
+    lx = cx + cw - P
+    for mark, word in reversed(MARK_WORDS):  # the key, right-aligned in the label row
+        t = text(lx, y - P, word, fontsize=8, fontweight="medium", color=CHART_FAINT,
+                 va="top", ha="right")
+        lx -= t.get_window_extent(renderer).width / CHART_DPI + 0.11
+        _draw_icon(fig, mark, lx, y - P - 0.057, 0.16, sky_card_at(y - P))
+        lx -= 0.22
+    n = len(s.dark_hours)
+    col = (cw - 2 * P) / n
+    size = min(0.32, col * 0.62)
+    for i, h in enumerate(s.dark_hours):
+        x = cx + P + col * (i + 0.5)
+        mark = _mark(h)
+        text(x, cy + ch - 0.47, f"{h.time:%H}", fontsize=9.5, fontweight="medium",
+             ha="center", va="center")
+        _draw_icon(fig, mark, x, cy + ch - 0.76, size, sky_card_at(cy + ch - 0.76))
+        fig.add_artist(Line2D([x - col * 0.38, x + col * 0.38], [cy + ch - 1.01] * 2,
+                              transform=inch, color=MARK_COLOURS[mark], lw=2,
+                              solid_capstyle="round"))
+        if REQUIRE_SETUP_WINDOW:
+            cue = ("set up" if h.time == su_start else "bed" if h.time == su_end else None)
+            if cue:
+                text(x, cy + ch - 1.08, cue, fontsize=7, color=CHART_SOFT, ha="center",
+                     va="top")
+    y -= HOURLY + GAP
+
+    # One card per cloud layer: both models as smooth curves.
+    for i, (layer, label, limit, height) in enumerate(cards):
+        cx, cy, cw, ch = card(y, height)
+        card_label(cx, y, cw, f"{label} · LIMIT {limit}%", icon="cloud")
+        ax = fig.add_axes(((cx + P) / W, (cy + 0.28) / H,
+                           (cw - 2 * P - 0.36) / W, (ch - 0.28 - 0.42) / H))
+        ax.set_facecolor("none")
+        for side in ax.spines.values():
+            side.set_visible(False)
+        ax.set_xlim(xs[0], xs[-1])
+        ax.set_ylim(-2, 104)
+        ax.yaxis.tick_right()
+        ax.set_yticks([0, 50, 100], ["0%", "", "100%"])  # 50% gridline, unlabelled
+        ax.tick_params(colors=CHART_FAINT, labelsize=8, length=0, pad=4)
+        ax.grid(axis="y", color=CHART_GRID, lw=0.5)
+        ax.set_axisbelow(True)
+        ticks = [(x, h.time) for x, h in zip(xs, span) if h.time.hour % 3 == 0]
+        ax.set_xticks([x for x, _ in ticks], [f"{t:%H:%M}" for _, t in ticks])
+        # Twilight either side of the dark window, and the set-up-to-bed window.
+        ax.axvspan(xs[0], x_of(s.dark_start), color=CHART_TWILIGHT, lw=0, zorder=0)
+        ax.axvspan(x_of(s.dark_end), xs[-1], color=CHART_TWILIGHT, lw=0, zorder=0)
+        if REQUIRE_SETUP_WINDOW:
+            ax.axvspan(x_of(su_start), x_of(su_end), color=CHART_SETUP_BAND, lw=0, zorder=0)
+        ax.axhline(limit, color=CHART_SOFT, lw=0.9, linestyle=(0, (0.1, 2.4)),
+                   dash_capstyle="round", zorder=2)
+
+        for _, src, colour in CHART_MODELS:
+            pts = [(x, getattr(h, src).get(layer)) for x, h in zip(xs, span)]
+            runs, cur = [], []
+            for x, v in pts:  # split at gaps in a model's coverage
+                if v is None:
+                    if cur:
+                        runs.append(cur)
+                    cur = []
+                else:
+                    cur.append((x, float(v)))
+            if cur:
+                runs.append(cur)
+            for run in runs:
+                px, py = _monotone([p[0] for p in run], [p[1] for p in run])
+                rgb = to_rgb(colour)
+                fill = ax.imshow([[(*rgb, 0.0)], [(*rgb, 0.24)]], aspect="auto",
+                                 extent=(px[0], px[-1], 0, 100), origin="lower",
+                                 interpolation="bicubic", zorder=1)
+                clip = Polygon(list(zip(px, py)) + [(px[-1], 0), (px[0], 0)],
+                               closed=True, facecolor="none", edgecolor="none")
+                ax.add_patch(clip)
+                fill.set_clip_path(clip)
+                ax.plot(px, py, color=colour, lw=1.5, solid_capstyle="round",
+                        solid_joinstyle="round", zorder=3)
+        ax.set_xlim(xs[0], xs[-1])
+        ax.set_ylim(-2, 104)
+        if i == 0:
+            # Model key, right-aligned in the first card's label row: a short
+            # line in each model's colour, as drawn in the charts.
+            lx = cx + cw - P
+            for model, _, colour in reversed(CHART_MODELS):
+                t = text(lx, y - P, MODEL_NAMES.get(model, model), fontsize=8,
+                         fontweight="medium", color=CHART_SOFT, va="top", ha="right")
+                lx -= t.get_window_extent(renderer).width / CHART_DPI + 0.07
+                fig.add_artist(Line2D([lx - 0.2, lx], [y - P - 0.057] * 2, transform=inch,
+                                      color=colour, lw=1.5, solid_capstyle="round"))
+                lx -= 0.38
+        y -= height + GAP
+
+    foot = "Shaded: twilight · lighter band: set up to bed"
+    text(M + 0.03, 0.12, foot, fontsize=7.5, color=CHART_FAINT, va="bottom")
+
+    buf = io.BytesIO()
+    fig.savefig(buf, format="png", dpi=CHART_DPI)
+    plt.close(fig)
+    return buf.getvalue()
+
+
 def _fit(message: str) -> str:
     """Trim to Pushover's length limit at a line break, so no tag is cut."""
     if len(message) <= PUSHOVER_MAX_CHARS:
@@ -938,7 +1339,7 @@ def _fit(message: str) -> str:
     return message[:cut if cut > 0 else PUSHOVER_MAX_CHARS - 2] + "\n…"
 
 
-def send_pushover(title: str, message: str) -> None:
+def send_pushover(title: str, message: str, chart: bytes | None = None) -> None:
     message = _fit(message)
     token = os.environ.get("PUSHOVER_TOKEN")
     user = os.environ.get("PUSHOVER_USER")
@@ -949,11 +1350,16 @@ def send_pushover(title: str, message: str) -> None:
             )
             print(f"[dry-run] {missing} not set — printing only.")
         print(f"--- {title} ---\n{message}")
+        if chart:
+            CHART_FILE.parent.mkdir(parents=True, exist_ok=True)
+            CHART_FILE.write_bytes(chart)
+            print(f"[dry-run] chart saved to {CHART_FILE}")
         return
     resp = requests.post(
         PUSHOVER_URL,
         data={"token": token, "user": user, "title": title,
               "message": message, "html": 1, "priority": 0},
+        files={"attachment": ("skyguard.png", chart, "image/png")} if chart else None,
         timeout=30,
     )
     resp.raise_for_status()
@@ -1088,18 +1494,25 @@ def main() -> int:
         and LIGHT_RANK[prev_light[s.night]] > LIGHT_RANK[s.light]
     ]
 
+    # The push carries one chart: the night its title is about.
     message: tuple[str, str] | None = None
+    charted: NightScore | None = None
     if RUN_MODE == "tonight":
         tonight = scores[0]
         if tonight.qualifies or downgraded or DAILY_DIGEST:
             message = build_tonight(tonight, changes[tonight.night], prev_light[tonight.night])
+            charted = tonight
     elif any(s.qualifies for s in scores):
         message = build_message(scores, changes)
+        charted = (next((s for s in scores if s.confident), None)
+                   or next(s for s in scores if s.qualifies))
     elif downgraded or DAILY_DIGEST:
         message = build_digest(scores, changes, downgraded)
+        charted = downgraded[0] if downgraded else scores[0]
 
     if message:
-        send_pushover(*message)
+        chart = render_chart(charted, hours) if SEND_CHART and charted else None
+        send_pushover(*message, chart)
     else:
         print("No qualifying nights and nothing downgraded — staying silent.")
 

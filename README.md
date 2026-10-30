@@ -110,6 +110,18 @@ the wind (sustained + peak gust), and — for short nights — an hour-by-hour l
 (`✓` both models agree usable with modest high cloud, `◐` both agree but under
 heavy high cloud, `~` only one model says usable, `✗` not usable).
 
+**Cloud chart.** Each push also carries an image of the night's forecast, so you
+can see *when* the cloud comes and goes rather than reconcile whole-night
+averages. It opens with the verdict in plain words ("Clear 19:00–23:00"), then
+an icon per dark hour (moon and stars = clear, moon over haze = heavy cirrus,
+moon behind a cloud = the models disagree, cloud = not usable) above a bar in
+the verdict's colour, then one card per layer — low, mid, high — with both
+models drawn as curves against that layer's limit. Twilight is shaded, and the
+set-up-to-bed window is lightly banded. The outlook charts the night its title
+is about. The chart needs matplotlib and uses the bundled Inter font
+(`fonts/`, SIL Open Font License); if it can't be drawn, the push goes out as
+text only.
+
 ## Configure
 
 **Location** — set as environment variables (recommended) or edit the defaults
@@ -152,6 +164,10 @@ hours the two runs are meant for.
 the per-night verdicts are kept between runs. Pruned automatically to the last
 `STATE_KEEP_RUNS` runs of nights that haven't happened yet.
 
+**Chart** — `SEND_CHART` (environment): `0` to send text-only pushes (default on).
+`CHART_FILE` (environment; default `.skyguard/chart.png`) is where a dry run
+saves the chart instead of sending it.
+
 ## Setup (GitHub Action)
 
 1. **Pushover**: create an [application/API token](https://pushover.net/apps/build)
@@ -190,7 +206,8 @@ LATITUDE=51.48 LONGITUDE=-0.0 TIMEZONE=Europe/London \
   DRY_RUN=1 .venv/bin/python main.py
 ```
 
-It prints the per-night scores and the message it *would* send. Add `DAILY_DIGEST=1`
+It prints the per-night scores and the message it *would* send, and saves the
+chart to `.skyguard/chart.png`. Add `DAILY_DIGEST=1`
 to preview the daily-digest message even when no night qualifies, and
 `RUN_MODE=tonight` to preview the evening update. A dry run leaves the history
 untouched; run without `DRY_RUN` (and without Pushover credentials, so it only
