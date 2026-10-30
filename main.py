@@ -21,6 +21,12 @@ gate on total cloud cover, which inflates with harmless high cirrus. Heavy
 forecast high cloud does, however, drop a night from 🟢 confident to 🟡
 speculative — see the confidence tiers in CONFIG.
 
+Cloud isn't the only thing between you and the stars. Fog (forecast visibility)
+blocks an hour like low cloud does; mist, and dust or smoke aloft (aerosol
+optical depth), dim it — the hour stays usable but drops out of the confident
+tier. Dew risk, a strong jet stream (poor seeing) and when the Moon is up are
+reported but don't change the verdict.
+
 Set your location with the LATITUDE / LONGITUDE / TIMEZONE environment variables
 (or edit the defaults below). Tune behaviour in the CONFIG block. Set DRY_RUN=1
 to print the message to stdout instead of pushing.
@@ -33,7 +39,7 @@ import logging
 import math
 import os
 import sys
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import date, datetime, time, timedelta, timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -122,7 +128,7 @@ HIGH_CLOUD_NOTE = 40  # average high cloud above this gets a note in the push
 # Confidence tiers. A night that passes the rules above is 🟡 SPECULATIVE; it is
 # 🟢 CONFIDENT only if both models also agree on a usable run of at least
 # CONFIDENT_MIN_RUN hours with high cloud at or below HIGH_CLOUD_CONFIDENT_MAX in
-# each model (and, with the setup gate on, the setup window passes that test
+# each model and no mist or aerosol haze (see below) (and, with the setup gate on, the setup window passes that test
 # too). Thin cirrus is fine for narrowband, but a forecast of heavy high cloud
 # can't tell thin cirrus from a thick frontal sheet — and such nights usually
 # fail. Checked against a year of observed cloud near the site: confident nights
@@ -154,6 +160,37 @@ PRECIP_PROB_MAX = 0        # %; any rain chance above this vetoes the night
 WIND_SUSTAINED_WARN_KMH = 25
 WIND_GUST_WARN_KMH = 40
 WIND_GUST_VETO_KMH = 55
+
+# Mist and fog. Water droplets near the ground don't show up as cloud: every
+# layer can read 0% while mist hides all but the brightest stars. Forecast
+# visibility catches it. KNMI HARMONIE publishes visibility but ECMWF doesn't
+# (via Open-Meteo), so when no model gives visibility for an hour, a dew-point
+# spread (temperature minus dew point) at or below MIST_SPREAD_C stands in for
+# mist. Fog in either model makes an hour unusable, as low cloud would (a model
+# without visibility can't vouch for the hour); mist keeps the hour usable but
+# out of the confident tier (◐), like heavy high cloud. Model visibility is a
+# rough guide: on 30 Oct 2026 a forecast of ~6 km came with a sky showing only
+# the brightest stars, so the line is set well above that, erring towards hazy.
+FOG_VISIBILITY_M = 1000
+MIST_VISIBILITY_M = 20000
+MIST_SPREAD_C = 1.5
+
+# Dew. When the air cools to within DEW_SPREAD_C of its dew point, optics dew up
+# (frost below 0 °C) — reported so you fit the heaters; it doesn't change the verdict.
+DEW_SPREAD_C = 2.0
+
+# Aerosols: Saharan dust, wildfire smoke and pollution haze dim the whole sky
+# even when it's cloud-free. Aerosol optical depth (AOD, at 550 nm) comes from
+# the CAMS forecast via Open-Meteo's air-quality API; clean air here is ~0.1.
+# An hour above AOD_HAZE_MAX stays usable but drops out of the confident tier.
+# This is a quality signal, not a safety one: if the fetch fails, it's skipped.
+AOD_HAZE_MAX = 0.3
+AIR_QUALITY_URL = "https://air-quality-api.open-meteo.com/v1/air-quality"
+
+# Seeing. A fast jet stream overhead (wind at 250 hPa, ~10 km up) means
+# turbulent air and soft, bloated stars. Reported above this speed, km/h
+# (~150 km/h ≈ 80 kn); it doesn't change the verdict. Only ECMWF publishes it.
+JET_SEEING_KMH = 150
 
 # A night qualifies when it has at least this many usable hours AND a continuous
 # usable run of at least this length. At high latitudes a midsummer nautical
@@ -239,6 +276,62 @@ class HourCloud:
     precip_prob: dict[str, int | None]  # {"primary": .., "secondary": ..}
     wind_kmh: dict[str, float | None]   # {"primary": .., "secondary": ..}
     gust_kmh: dict[str, float | None]   # {"primary": .., "secondary": ..}
+    # Haze, dew and seeing — each keyed "primary"/"secondary" like the above.
+    visibility_m: dict[str, float | None] = field(default_factory=dict)
+    temp_c: dict[str, float | None] = field(default_factory=dict)
+    dew_point_c: dict[str, float | None] = field(default_factory=dict)
+    jet_kmh: dict[str, float | None] = field(default_factory=dict)
+    aod: float | None = None  # aerosol optical depth (CAMS), None if unavailable
+
+    @property
+    def min_visibility_m(self) -> float | None:
+        vals = [v for v in self.visibility_m.values() if v is not None]
+        return min(vals) if vals else None
+
+    @property
+    def spread_c(self) -> float | None:
+        """Smallest temperature − dew point gap across the models."""
+        gaps = [self.temp_c[k] - self.dew_point_c[k] for k in self.temp_c
+                if self.temp_c[k] is not None and self.dew_point_c.get(k) is not None]
+        return min(gaps) if gaps else None
+
+    @property
+    def min_temp_c(self) -> float | None:
+        vals = [v for v in self.temp_c.values() if v is not None]
+        return min(vals) if vals else None
+
+    @property
+    def max_jet_kmh(self) -> float | None:
+        vals = [v for v in self.jet_kmh.values() if v is not None]
+        return max(vals) if vals else None
+
+    def fogged(self, src: str) -> bool:
+        """True when model `src` forecasts fog for this hour."""
+        vis = self.visibility_m.get(src)
+        return vis is not None and vis < FOG_VISIBILITY_M
+
+    @property
+    def fog(self) -> bool:
+        return any(self.fogged(k) for k in self.visibility_m)
+
+    @property
+    def misty(self) -> bool:
+        """Visibility below the mist line — or, with no visibility from any
+        model, the air within MIST_SPREAD_C of its dew point."""
+        vis = self.min_visibility_m
+        if vis is not None:
+            return vis < MIST_VISIBILITY_M
+        spread = self.spread_c
+        return spread is not None and spread <= MIST_SPREAD_C
+
+    @property
+    def aerosol_hazy(self) -> bool:
+        return self.aod is not None and self.aod > AOD_HAZE_MAX
+
+    @property
+    def hazy(self) -> bool:
+        """Mist or aerosol: the hour is usable but not confident."""
+        return self.misty or self.aerosol_hazy
 
     @property
     def max_precip_mm(self) -> float:
@@ -274,15 +367,22 @@ class HourCloud:
             return True
         return self.max_precip_prob > PRECIP_PROB_MAX
 
-    @staticmethod
-    def _usable(layers: dict[str, int | None], strict: bool = False) -> bool | None:
-        """True/False if the model has data for this hour, else None.
+    def _usable(self, src: str, strict: bool = False) -> bool | None:
+        """True/False if model `src` ("primary"/"secondary") has data for this
+        hour, else None.
 
-        Gates on low and mid cloud; high cloud only if HIGH_CLOUD_MAX is set,
-        or — when `strict` (the confident tier) — at HIGH_CLOUD_CONFIDENT_MAX.
+        Gates on low and mid cloud and on fog in either model (only one may
+        forecast visibility, so the other can't vouch for the hour); high cloud only if
+        HIGH_CLOUD_MAX is set. When `strict` (the confident tier), high cloud is
+        capped at HIGH_CLOUD_CONFIDENT_MAX and the hour mustn't be hazy.
         """
+        layers = getattr(self, src)
         if all(layers.get(k) is None for k in LAYERS):
             return None
+        if self.fog:
+            return False
+        if strict and self.hazy:
+            return False
         low, mid, high = layers.get("low"), layers.get("mid"), layers.get("high")
         if low is not None and low > LOW_CLOUD_MAX:
             return False
@@ -298,22 +398,33 @@ class HourCloud:
     @property
     def usable_confident(self) -> bool:
         """Both models present and both say usable."""
-        return self._usable(self.primary) is True and self._usable(self.secondary) is True
+        return self._usable("primary") is True and self._usable("secondary") is True
 
     @property
     def usable_any(self) -> bool:
-        return self._usable(self.primary) is True or self._usable(self.secondary) is True
+        return self._usable("primary") is True or self._usable("secondary") is True
 
     @property
     def usable_strict(self) -> bool:
-        """Confident tier: both models usable with high cloud capped too."""
-        return (self._usable(self.primary, strict=True) is True
-                and self._usable(self.secondary, strict=True) is True)
+        """Confident tier: both models usable with high cloud capped, no haze."""
+        return (self._usable("primary", strict=True) is True
+                and self._usable("secondary", strict=True) is True)
 
     @property
     def usable_any_strict(self) -> bool:
-        return (self._usable(self.primary, strict=True) is True
-                or self._usable(self.secondary, strict=True) is True)
+        return (self._usable("primary", strict=True) is True
+                or self._usable("secondary", strict=True) is True)
+
+    @property
+    def dimmed_by(self) -> str | None:
+        """What keeps a usable hour out of the confident tier, in words."""
+        if self.misty:
+            return "mist"
+        if self.aerosol_hazy:
+            return "dust or smoke haze"
+        if self.usable_confident and not self.usable_strict:
+            return "heavy high cloud"
+        return None
 
     def layer(self, name: str) -> int | None:
         """Representative value for a layer: primary if present, else secondary."""
@@ -353,6 +464,15 @@ class NightScore:
     setup_align_from: datetime | None  # earliest clear + dark-enough moment
     strict_run_len: int           # both models agree AND high cloud ≤ confident cap
     setup_strict_ok: bool         # setup window passes with the high-cloud cap
+    mist_from: datetime | None    # first misty dark hour
+    fog_from: datetime | None     # first foggy dark hour
+    min_visibility_m: float | None
+    min_spread_c: float | None    # smallest temperature − dew point gap
+    min_temp_c: float | None
+    aod_max: float | None         # peak aerosol optical depth (None: no CAMS data)
+    jet_max_kmh: int | None       # peak 250 hPa wind
+    moon_up: list[tuple[datetime, datetime]]  # spans with the Moon up, within dark hours
+    dimmed_by: str | None         # what most often keeps usable hours from the confident tier
 
     @property
     def sky_ok(self) -> bool:
@@ -400,9 +520,10 @@ class NightScore:
             return "only one model available"
         if self.best_run_len < CONFIDENT_MIN_RUN:
             return "models disagree"
+        cause = self.dimmed_by or "heavy high cloud"
         if self.strict_run_len < CONFIDENT_MIN_RUN:
-            return "heavy high cloud"
-        return "heavy high cloud at setup time"
+            return cause
+        return f"{cause} at setup time"
 
     @property
     def usable_hours(self) -> int:
@@ -426,7 +547,8 @@ def fetch_forecast() -> list[HourCloud]:
         "longitude": LONGITUDE,
         "hourly": "cloud_cover_low,cloud_cover_mid,cloud_cover_high,"
                   "precipitation,precipitation_probability,"
-                  "wind_speed_10m,wind_gusts_10m",
+                  "wind_speed_10m,wind_gusts_10m,"
+                  "visibility,temperature_2m,dew_point_2m,wind_speed_250hPa",
         "models": f"{PRIMARY_MODEL},{SECONDARY_MODEL}",
         "timezone": TIMEZONE,
         "forecast_days": FORECAST_DAYS,
@@ -456,6 +578,14 @@ def fetch_forecast() -> list[HourCloud]:
     gust_kmh = {"primary": series("wind_gusts_10m", PRIMARY_MODEL),
                 "secondary": series("wind_gusts_10m", SECONDARY_MODEL)}
 
+    def both(field: str) -> dict[str, list]:
+        return {"primary": series(field, PRIMARY_MODEL),
+                "secondary": series(field, SECONDARY_MODEL)}
+
+    visibility, temp, dew, jet = (both(f) for f in (
+        "visibility", "temperature_2m", "dew_point_2m", "wind_speed_250hPa"))
+    aod = fetch_aerosol()
+
     out: list[HourCloud] = []
     for i, t in enumerate(times):
         dt = datetime.fromisoformat(t).replace(tzinfo=TZ)
@@ -467,8 +597,33 @@ def fetch_forecast() -> list[HourCloud]:
             precip_prob={k: precip_prob[k][i] for k in precip_prob},
             wind_kmh={k: wind_kmh[k][i] for k in wind_kmh},
             gust_kmh={k: gust_kmh[k][i] for k in gust_kmh},
+            visibility_m={k: visibility[k][i] for k in visibility},
+            temp_c={k: temp[k][i] for k in temp},
+            dew_point_c={k: dew[k][i] for k in dew},
+            jet_kmh={k: jet[k][i] for k in jet},
+            aod=aod.get(t),
         ))
     return out
+
+
+def fetch_aerosol() -> dict[str, float | None]:
+    """Aerosol optical depth by local hour (Open-Meteo's ISO time string), from
+    the CAMS forecast. Best effort: on any failure the haze check is skipped."""
+    params = {
+        "latitude": LATITUDE,
+        "longitude": LONGITUDE,
+        "hourly": "aerosol_optical_depth",
+        "timezone": TIMEZONE,
+        "forecast_days": FORECAST_DAYS,
+    }
+    try:
+        resp = requests.get(AIR_QUALITY_URL, params=params, timeout=30)
+        resp.raise_for_status()
+        hourly = resp.json()["hourly"]
+        return dict(zip(hourly["time"], hourly["aerosol_optical_depth"]))
+    except (requests.RequestException, KeyError, ValueError) as e:
+        print(f"[aerosol] no CAMS forecast ({e!r}) — skipping the haze check.")
+        return {}
 
 
 # --------------------------------------------------------------------------- #
@@ -522,6 +677,25 @@ def moon_for(night: date) -> tuple[int, str]:
             label = name
             break
     return illum, label
+
+
+def moon_up(start: datetime, end: datetime) -> list[tuple[datetime, datetime]]:
+    """The spans between `start` and `end` with the Moon above the horizon, to
+    the nearest 10 minutes. astral's moon.elevation ignores the time zone of
+    the time it's given (its sun.elevation doesn't), so it's passed UTC."""
+    spans: list[tuple[datetime, datetime]] = []
+    t, up_since = start, None
+    while t <= end:
+        up = moon.elevation(OBSERVER, t.astimezone(timezone.utc)) > 0
+        if up and up_since is None:
+            up_since = t
+        elif not up and up_since is not None:
+            spans.append((up_since, t))
+            up_since = None
+        t += timedelta(minutes=10)
+    if up_since is not None:
+        spans.append((up_since, end))
+    return spans
 
 
 def exposure_window(night: date) -> tuple[datetime, datetime]:
@@ -613,6 +787,21 @@ def score_night(
     illum, label = moon_for(night)
     tentative = not (confident >= MIN_USABLE_HOURS and best_run_len >= MIN_CONTINUOUS_RUN)
 
+    # Haze, dew and seeing over the dark hours.
+    def least(vals):
+        vals = [v for v in vals if v is not None]
+        return min(vals) if vals else None
+
+    def most(vals):
+        vals = [v for v in vals if v is not None]
+        return max(vals) if vals else None
+
+    misty = [h.time for h in dark_hours if h.misty]
+    foggy = [h.time for h in dark_hours if h.fog]
+    jet = most(h.max_jet_kmh for h in dark_hours)
+    causes = [h.dimmed_by for h in dark_hours if h.usable_any and h.dimmed_by]
+    dimmed_by = max(sorted(set(causes)), key=causes.count) if causes else None
+
     return NightScore(
         night=night,
         dark_hours=dark_hours,
@@ -644,6 +833,15 @@ def score_night(
         setup_align_from=setup_align_from,
         strict_run_len=strict_run_len,
         setup_strict_ok=setup_strict_ok,
+        mist_from=misty[0] if misty else None,
+        fog_from=foggy[0] if foggy else None,
+        min_visibility_m=least(h.min_visibility_m for h in dark_hours),
+        min_spread_c=least(h.spread_c for h in dark_hours),
+        min_temp_c=least(h.min_temp_c for h in dark_hours),
+        aod_max=most(h.aod for h in dark_hours),
+        jet_max_kmh=round(jet) if jet is not None else None,
+        moon_up=moon_up(times[0], times[-1] + timedelta(hours=1)),
+        dimmed_by=dimmed_by,
     )
 
 
@@ -745,8 +943,9 @@ def _fmt_layer(stat: tuple[int, int] | None) -> str:
 
 
 def _mark(h: HourCloud) -> str:
-    """✓ both models usable, high cloud modest · ◐ both usable but heavy high
-    cloud · ~ only one model usable · ✗ neither."""
+    """✓ both models usable, high cloud modest, no haze · ◐ both usable but
+    hazy (heavy high cloud, mist, or dust or smoke) · ~ only one model usable ·
+    ✗ neither (cloud or fog)."""
     if h.usable_strict:
         return "✓"
     if h.usable_confident:
@@ -778,7 +977,8 @@ def format_night(s: NightScore, change: str | None = None, strip: bool = False) 
     run = f"best run {run_len}h from {run_start:%H:%M}" if run_len else "no usable run"
 
     lines = [
-        f"<b>{day}</b> · dark {window} · Moon {s.moon_illum}% ({s.moon_label})",
+        f"<b>{day}</b> · dark {window} · Moon {s.moon_illum}% "
+        f"({s.moon_label}, {_moon_when(s)})",
         f"{s.usable_hours}/{total} h usable · {run} · conf: {conf}",
     ]
 
@@ -803,6 +1003,7 @@ def format_night(s: NightScore, change: str | None = None, strip: bool = False) 
     elif high is not None and high[0] >= HIGH_CLOUD_NOTE:
         cloud += " — some high cloud (ok for narrowband)"
     lines.append(cloud)
+    lines += _air_lines(s)
 
     if s.rain_vetoed:
         lines.append(f"🌧 rain {s.exposure_window}: {_rain_detail(s)}")
@@ -828,6 +1029,50 @@ def format_night(s: NightScore, change: str | None = None, strip: bool = False) 
     if change:
         lines.append(change)
     return "\n".join(lines)
+
+
+def _moon_when(s: NightScore) -> str:
+    """When the Moon is up during the dark hours: 'up from 20:10', 'down all night'."""
+    if not s.moon_up:
+        return "down all night"
+    parts = []
+    for rise, set_ in s.moon_up:
+        if rise <= s.dark_start and set_ >= s.dark_end:
+            return "up all night"
+        if rise <= s.dark_start:
+            parts.append(f"sets {set_:%H:%M}")
+        elif set_ >= s.dark_end:
+            parts.append(f"rises {rise:%H:%M}")
+        else:
+            parts.append(f"up {rise:%H:%M}–{set_:%H:%M}")
+    return ", ".join(parts)
+
+
+def _air_lines(s: NightScore) -> list[str]:
+    """Mist, fog, dust or smoke, dew and seeing — only the ones that apply."""
+    lines = []
+    haze = []
+    if s.fog_from and s.mist_from and s.mist_from < s.fog_from:
+        haze.append(f"mist from {s.mist_from:%H:%M}, fog from {s.fog_from:%H:%M}")
+    elif s.fog_from:
+        haze.append(f"fog from {s.fog_from:%H:%M}")
+    elif s.mist_from:
+        haze.append(f"mist from {s.mist_from:%H:%M}")
+    if haze:
+        if s.min_visibility_m is not None:
+            haze[0] += f" (visibility down to {s.min_visibility_m / 1000:.1f} km)"
+        else:
+            haze[0] += " (air near its dew point)"
+    if s.aod_max is not None and s.aod_max > AOD_HAZE_MAX:
+        haze.append(f"dust or smoke haze (AOD up to {s.aod_max:.2f})")
+    if haze:
+        lines.append("🌫 " + " · ".join(haze))
+    if s.min_spread_c is not None and s.min_spread_c <= DEW_SPREAD_C:
+        frost = s.min_temp_c is not None and s.min_temp_c <= 0
+        lines.append(f"{'❄ frost' if frost else '💧 dew'} likely — heaters on")
+    if s.jet_max_kmh is not None and s.jet_max_kmh > JET_SEEING_KMH:
+        lines.append(f"🌀 jet stream {s.jet_max_kmh} km/h overhead — seeing likely poor")
+    return lines
 
 
 LIGHT_RANK = {"🔴": 0, "🟡": 1, "🟢": 2}
@@ -859,9 +1104,10 @@ def _reason(s: NightScore) -> str:
     if REQUIRE_SETUP_WINDOW and not s.setup_ok:
         if s.setup_alignable == 0:
             return "🌆 not dark enough to align before bed"
-        return "☁ cloudy during the setup window"
+        return f"☁ {'foggy' if _foggy(s) else 'cloudy'} during the setup window"
     low = s.layer_stats["low"]
-    return f"☁ too cloudy (low {low[0] if low else '?'}%)"
+    fog = f", fog from {s.fog_from:%H:%M}" if s.fog_from else ""
+    return f"☁ {_short_reason(s)} (low {low[0] if low else '?'}%{fog})"
 
 
 def _outlook_line(s: NightScore, change: str | None) -> str:
@@ -919,8 +1165,15 @@ def _short_reason(s: NightScore) -> str:
     if REQUIRE_SETUP_WINDOW and not s.setup_ok:
         if s.setup_alignable == 0:
             return "not dark enough to align before bed"
-        return "cloudy before bed"
-    return "too cloudy"
+        return "foggy before bed" if _foggy(s) else "cloudy before bed"
+    return "foggy" if _foggy(s) else "too cloudy"
+
+
+def _foggy(s: NightScore) -> bool:
+    """Fog, not cloud, is what rules the night out: fog is forecast and the
+    low cloud stays within its limit on average."""
+    low = s.layer_stats["low"]
+    return bool(s.fog_from) and low is not None and low[0] <= LOW_CLOUD_MAX
 
 
 def build_tonight(s: NightScore, change: str | None, prev_light: str | None) -> tuple[str, str]:
@@ -959,12 +1212,13 @@ CHART_SETUP_BAND = (1, 1, 1, 0.05)
 CHART_MODELS = ((PRIMARY_MODEL, "primary", "#2a93dc"),
                 (SECONDARY_MODEL, "secondary", "#e25c84"))
 MARK_COLOURS = {"✓": "#30d158", "◐": "#ffd60a", "~": "#ff9f0a", "✗": "#ff453a"}
-MARK_WORDS = (("✓", "clear"), ("◐", "cirrus"), ("~", "models differ"), ("✗", "cloudy"))
+MARK_WORDS = (("✓", "clear"), ("◐", "hazy"), ("~", "models differ"), ("✗", "cloudy"))
 CHART_MOON = "#fff1c4"
 CHART_WISP = "#c3cce3"
 CHART_CLOUD = "#e9edf6"
 CHART_CLOUD_GREY = "#a6afc4"
 CHART_CLOUD_DARK = "#737d96"
+VIS_SCALE_KM = 30  # visibility card: 0 to this, clearer air pinned at the top
 MODEL_NAMES = {
     "knmi_harmonie_arome_netherlands": "KNMI HARMONIE",
     "ecmwf_ifs025": "ECMWF IFS",
@@ -1001,12 +1255,16 @@ def _headline(s: NightScore) -> tuple[str, str]:
     if s.qualifies:
         run_len, run_start = s.run
         run_end = run_start + timedelta(hours=run_len)
+        # A 🟡 night dimmed by mist or haze isn't "clear", whatever the cloud says.
+        reason = "" if s.confident else s.speculative_reason
+        word = ("Misty" if reason.startswith("mist")
+                else "Hazy" if reason.startswith(("dust", "heavy high cloud")) else "Clear")
         if run_start <= s.dark_start and run_end >= s.dark_end:
-            head = "Clear all night"
+            head = f"{word} all night"
         elif run_end >= s.dark_end:
-            head = f"Clear from {run_start:%H:%M}"
+            head = f"{word} from {run_start:%H:%M}"
         else:
-            head = f"Clear {run_start:%H:%M}–{run_end:%H:%M}"
+            head = f"{word} {run_start:%H:%M}–{run_end:%H:%M}"
     else:
         head = _short_reason(s).capitalize()
     verdict = {"🟢": "Confident go", "🟡": f"Maybe: {s.speculative_reason}",
@@ -1099,7 +1357,7 @@ def _mix(a, b, f: float) -> tuple[float, float, float]:
 
 def _draw_icon(fig, mark: str, x: float, y: float, size: float, cutout) -> None:
     """A night-sky weather icon for an hour's verdict, centred on (x, y) inches:
-    ✓ moon and stars · ◐ moon behind wisps of cirrus · ~ moon partly behind a
+    ✓ moon and stars · ◐ moon behind wisps of cirrus or mist · ~ moon partly behind a
     cloud (the models disagree) · ✗ overcast. `cutout` is the colour behind
     the icon, used to separate overlapping shapes."""
     from matplotlib.lines import Line2D
@@ -1148,6 +1406,10 @@ def _draw_icon(fig, mark: str, x: float, y: float, size: float, cutout) -> None:
         moon(0, 0, 0.8, colour=_mix(cutout, CHART_INK, 0.5))
     elif mark == "cloud":
         cloud(0, 0.1, 1.0, _mix(cutout, CHART_INK, 0.5), halo=False)
+    elif mark == "mist":  # three drifting lines
+        for x0, x1, wy in ((-0.85, 0.55, 0.5), (-0.55, 0.85, 0.0), (-0.85, 0.4, -0.5)):
+            add(Line2D([x + x0 * u, x + x1 * u], [y + wy * u] * 2,
+                       color=_mix(cutout, CHART_INK, 0.5), lw=1.1, solid_capstyle="round"))
     else:
         cloud(0.28, 0.3, 0.62, CHART_CLOUD_DARK)
         cloud(-0.1, -0.12, 0.92, CHART_CLOUD_GREY)
@@ -1172,9 +1434,23 @@ def _draw_chart(plt, s: NightScore, hours: list[HourCloud]) -> bytes | None:
     su_start, su_end = setup_window(s.night)
 
     high_limit = HIGH_CLOUD_MAX if HIGH_CLOUD_MAX is not None else HIGH_CLOUD_CONFIDENT_MAX
-    cards = [("low", "LOW CLOUD", LOW_CLOUD_MAX, 1.75),
-             ("mid", "MID CLOUD", MID_CLOUD_MAX, 1.1),
-             ("high", "HIGH CLOUD · CIRRUS", high_limit, 1.3)]
+    # (key, title, limit on the 0–100 scale, card height, y labels)
+    cards = [("low", f"LOW CLOUD · LIMIT {LOW_CLOUD_MAX}%", LOW_CLOUD_MAX, 1.75, ("0%", "100%")),
+             ("mid", f"MID CLOUD · LIMIT {MID_CLOUD_MAX}%", MID_CLOUD_MAX, 1.1, ("0%", "100%")),
+             ("high", f"HIGH CLOUD · CIRRUS · LIMIT {high_limit}%", high_limit, 1.3,
+              ("0%", "100%"))]
+    # Visibility, for mist and fog, on the same 0–100 scale: 0 to VIS_SCALE_KM,
+    # anything clearer pinned at the top. Only drawn when a model publishes it.
+    if any(v is not None for h in span for v in h.visibility_m.values()):
+        cards.append(("visibility", f"VISIBILITY · MIST BELOW {MIST_VISIBILITY_M // 1000} KM",
+                      MIST_VISIBILITY_M / 1000 / VIS_SCALE_KM * 100, 1.1,
+                      ("0 km", f"{VIS_SCALE_KM}+ km")))
+
+    def value(h: HourCloud, src: str, key: str) -> float | None:
+        if key == "visibility":
+            vis = h.visibility_m.get(src)
+            return None if vis is None else min(100.0, vis / 1000 / VIS_SCALE_KM * 100)
+        return getattr(h, src).get(key)
 
     # Layout in inches, top down.
     W, M, P, GAP, R = CHART_WIDTH, 0.22, 0.16, 0.11, 0.16
@@ -1257,19 +1533,19 @@ def _draw_chart(plt, s: NightScore, hours: list[HourCloud]) -> bytes | None:
                      va="top")
     y -= HOURLY + GAP
 
-    # One card per cloud layer: both models as smooth curves.
-    for i, (layer, label, limit, height) in enumerate(cards):
+    # One card per cloud layer, then visibility: both models as smooth curves.
+    for i, (key, label, limit, height, (y_lo, y_hi)) in enumerate(cards):
         cx, cy, cw, ch = card(y, height)
-        card_label(cx, y, cw, f"{label} · LIMIT {limit}%", icon="cloud")
+        card_label(cx, y, cw, label, icon="mist" if key == "visibility" else "cloud")
         ax = fig.add_axes(((cx + P) / W, (cy + 0.28) / H,
-                           (cw - 2 * P - 0.36) / W, (ch - 0.28 - 0.42) / H))
+                           (cw - 2 * P - 0.46) / W, (ch - 0.28 - 0.42) / H))
         ax.set_facecolor("none")
         for side in ax.spines.values():
             side.set_visible(False)
         ax.set_xlim(xs[0], xs[-1])
         ax.set_ylim(-2, 104)
         ax.yaxis.tick_right()
-        ax.set_yticks([0, 50, 100], ["0%", "", "100%"])  # 50% gridline, unlabelled
+        ax.set_yticks([0, 50, 100], [y_lo, "", y_hi])  # midline unlabelled
         ax.tick_params(colors=CHART_FAINT, labelsize=8, length=0, pad=4)
         ax.grid(axis="y", color=CHART_GRID, lw=0.5)
         ax.set_axisbelow(True)
@@ -1284,7 +1560,7 @@ def _draw_chart(plt, s: NightScore, hours: list[HourCloud]) -> bytes | None:
                    dash_capstyle="round", zorder=2)
 
         for _, src, colour in CHART_MODELS:
-            pts = [(x, getattr(h, src).get(layer)) for x, h in zip(xs, span)]
+            pts = [(x, value(h, src, key)) for x, h in zip(xs, span)]
             runs, cur = [], []
             for x, v in pts:  # split at gaps in a model's coverage
                 if v is None:
@@ -1448,6 +1724,12 @@ def log_scores(scores: list[NightScore]) -> None:
             f"{s.rain_max_prob if s.rain_max_prob is not None else '-'}%"
             f"{f' ({s.rain_unknown_hours}h unknown)' if s.rain_unknown_hours else ''}, "
             f"wind {s.wind_max_kmh}/gust {s.gust_max_kmh}km/h, "
+            f"vis min {f'{s.min_visibility_m / 1000:.1f}km' if s.min_visibility_m is not None else '-'}"
+            f"{f' mist {s.mist_from:%H:%M}' if s.mist_from else ''}"
+            f"{f' fog {s.fog_from:%H:%M}' if s.fog_from else ''}, "
+            f"dew spread {f'{s.min_spread_c:.1f}' if s.min_spread_c is not None else '-'}C, "
+            f"AOD {f'{s.aod_max:.2f}' if s.aod_max is not None else '-'}, "
+            f"jet {s.jet_max_kmh if s.jet_max_kmh is not None else '-'}km/h, "
             f"moon {s.moon_illum}%"
         )
 

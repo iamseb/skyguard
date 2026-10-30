@@ -42,6 +42,20 @@ a night looks usable.
   the night. Values are km/h (Open-Meteo's default unit). The forecast is
   open-terrain 10 m wind, so a sheltered site is usually calmer — the defaults are
   deliberately generous. Set the veto very high to disable it.
+- **Mist, fog and haze (what cloud cover misses)**: water droplets near the
+  ground don't show up as cloud — every layer can read 0% while mist hides all
+  but the brightest stars. SkyGuard reads forecast **visibility** (KNMI HARMONIE
+  publishes it; ECMWF doesn't, so the dew-point spread stands in when no model
+  has it). An hour with **fog** (visibility under `FOG_VISIBILITY_M`, default
+  1 km, in either model) is not usable, like low cloud. **Mist** (under
+  `MIST_VISIBILITY_M`, default 20 km) and **dust or smoke haze** (CAMS aerosol
+  optical depth above `AOD_HAZE_MAX`, default 0.3; clean air is ~0.1) keep the
+  hour usable but out of the confident tier, so such a night is 🟡 at best. The
+  aerosol forecast is best effort: if it can't be fetched, that check is skipped.
+- **Reported, not judged**: **dew or frost** risk (air within `DEW_SPREAD_C`,
+  default 2 °C, of its dew point — fit the heaters), a fast **jet stream** overhead
+  (250 hPa wind above `JET_SEEING_KMH`, default 150 km/h — soft stars, poor
+  seeing), and **when the Moon is up** during the dark hours.
 - **Setup window (must be able to deploy + polar align before bed)**: you have to
   physically set up and polar align at the *start* of a session, before bed — so a
   night that only clears after you're asleep is useless. With `REQUIRE_SETUP_WINDOW`
@@ -105,18 +119,21 @@ a night looks usable.
   **🔴** off (cloud, rain, wind, or no clear + dark hour to align before bed).
 
 The push explains itself: per night it shows the dark window, how many hours are
-usable, the best continuous run, the moon, the per-layer cloud (average + peak),
-the wind (sustained + peak gust), and — for short nights — an hour-by-hour line
-(`✓` both models agree usable with modest high cloud, `◐` both agree but under
-heavy high cloud, `~` only one model says usable, `✗` not usable).
+usable, the best continuous run, the moon and when it's up, the per-layer cloud
+(average + peak), any mist, fog, haze, dew or jet-stream warning, the wind
+(sustained + peak gust), and — for short nights — an hour-by-hour line (`✓` both
+models agree usable with modest high cloud and no haze, `◐` both agree but hazy:
+heavy high cloud, mist, or dust or smoke, `~` only one model says usable, `✗` not
+usable).
 
 **Cloud chart.** Each push also carries an image of the night's forecast, so you
 can see *when* the cloud comes and goes rather than reconcile whole-night
-averages. It opens with the verdict in plain words ("Clear 19:00–23:00"), then
-an icon per dark hour (moon and stars = clear, moon over haze = heavy cirrus,
-moon behind a cloud = the models disagree, cloud = not usable) above a bar in
-the verdict's colour, then one card per layer — low, mid, high — with both
-models drawn as curves against that layer's limit. Twilight is shaded, and the
+averages. It opens with the verdict in plain words ("Clear 19:00–23:00", or
+"Misty …" / "Hazy …" when that's what holds it back), then an icon per dark hour
+(moon and stars = clear, moon over haze = heavy cirrus or mist, moon behind a
+cloud = the models disagree, cloud = not usable) above a bar in the verdict's
+colour, then one card per layer — low, mid, high — with both models drawn as
+curves against that layer's limit, and a visibility card with the mist line. Twilight is shaded, and the
 set-up-to-bed window is lightly banded. The outlook charts the night its title
 is about. The chart needs matplotlib and uses the bundled Inter font
 (`fonts/`, SIL Open Font License); if it can't be drawn, the push goes out as
@@ -150,6 +167,12 @@ bedtime every night.
 **Wind** — `WIND_SUSTAINED_WARN_KMH` / `WIND_GUST_WARN_KMH` (km/h; above these a
 night is flagged **⚠ breezy** but still qualifies), `WIND_GUST_VETO_KMH` (gusts
 above this reject the night; set very high to disable the veto).
+
+**Mist, fog, haze, dew, seeing** — `FOG_VISIBILITY_M` / `MIST_VISIBILITY_M`
+(metres), `MIST_SPREAD_C` (°C; the mist stand-in when no model gives visibility),
+`AOD_HAZE_MAX`, `DEW_SPREAD_C` (°C), `JET_SEEING_KMH` (km/h). Forecast
+visibility is rough — if mist warnings fire on nights that turn out crisp,
+lower `MIST_VISIBILITY_M`.
 
 **Daily digest** — `DAILY_DIGEST` (environment variable / Actions Variable): `1`
 (or `true`/`yes`/`on`) to send a status every run; unset or `0` to stay silent
